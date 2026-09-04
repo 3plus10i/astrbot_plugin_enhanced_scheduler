@@ -264,7 +264,7 @@ class EnhancedSchedulerPlugin(Star):
                 continue
 
             # 执行任务；success 表示"成功执行了动作"（含空动作视为成功）
-            action, targets_result, detail, success = await self._execute_task(task, now)
+            action, targets_result, detail, success = await self._execute_task(task, now, res.get("trigger_desc"))
 
             # 只有成功执行才更新 last_success_time（冷却型依赖此）；
             # skip（逻辑未通过）与发送失败都不推进冷却
@@ -291,13 +291,15 @@ class EnhancedSchedulerPlugin(Star):
     # 任务执行
     # ─────────────────────────────────────────────────────────────
 
-    async def _execute_task(self, task: dict, now: float):
+    async def _execute_task(self, task: dict, now: float, trigger_desc: Optional[dict] = None):
         """
         执行任务内容并发送。返回 (action, targets_result, detail, success)。
         action: "send_fixed" | "send_llm" | "noop" | "partial" | "failed"
         targets_result: [{"umo":..., "ok":bool, "error":str}, ...]
         success: 是否"成功执行了动作"——空动作(内容留空)视为成功；发送时**所有目标都成功**才为 True，
                  任一部分失败即视为失败（不静默降级为直接发送）。
+        trigger_desc: {id: str} 各触发器结果描述（用于模板变量 {{id}}）；
+                      自动触发由 evaluate_task 提供，手动触发时缺省则由本方法兜底生成。
         """
         content = task.get("content", {})
         text = str(content.get("text", "") or "")
@@ -311,7 +313,11 @@ class EnhancedSchedulerPlugin(Star):
         if not targets:
             return "noop", [], "无发送对象，跳过", False
 
-        rendered = core.render_template(text, {}, now)
+        # 触发器结果描述（{{id}} 模板变量）：自动触发由 evaluate_task 提供；手动触发兜底生成
+        if trigger_desc is None:
+            trigger_desc = self._describe_triggers(task, now)
+        render_params = {str(k): v for k, v in trigger_desc.items()}
+        rendered = core.render_template(text, render_params, now)
 
         # 独立 AI：所有目标共享一次生成结果（不依赖会话人格）；
         # chat_provider_id 从第一个目标 UMO 的会话配置获取。
@@ -369,6 +375,24 @@ class EnhancedSchedulerPlugin(Star):
             detail = f"部分失败（{ok_count}/{total} 成功）: " + "; ".join(errors)
             return "partial", targets_result, detail, False
         return "failed", targets_result, "全部失败: " + "; ".join(errors), False
+
+    def _describe_triggers(self, task: dict, now: float) -> Dict[str, str]:
+        """生成任务内每个触发器的结果描述（手动触发等未经过 evaluate_task 的场景兜底）。
+        主动型视为未到点（手动触发绕过触发规则），被动型按当前时刻实时求值。返回 {str(id): desc}。"""
+        desc: Dict[str, str] = {}
+        last_success = float(task.get("last_success_time", 0.0) or 0.0)
+        for tg in task.get("triggers", []):
+            if not isinstance(tg, dict):
+                continue
+            tid = tg.get("id")
+            if not isinstance(tid, int):
+                continue
+            if tg.get("type") in core.ACTIVE_TYPES:
+                desc[str(tid)] = core.describe_active_trigger(tg, None)
+            else:
+                _, d = core.evaluate_passive_trigger(tg, now, last_success)
+                desc[str(tid)] = d
+        return desc
 
     async def _llm_generate_for_target(self, umo: str, user_prompt: str) -> tuple:
         """

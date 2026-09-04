@@ -362,33 +362,9 @@ def has_pending_fire(tasks: Dict[str, Any], now_ts: float) -> bool:
 # ─────────────────────────────────────────────────────────────────────
 
 def passive_tof(trigger: Dict[str, Any], now_ts: float, task_last_success: float) -> bool:
-    """被动触发器实时求值。对主动触发器返回 False（不应被此函数调用）。"""
-    ttype = trigger.get("type")
-    cfg = trigger.get("config", {})
-
-    if ttype == T_WINDOW:
-        return _window_tof(cfg, now_ts)
-
-    if ttype == T_RANDOM:
-        try:
-            th = float(cfg.get("threshold", 0.0))
-        except (TypeError, ValueError):
-            th = 0.0
-        if th <= 0.0:
-            return False
-        if th >= 1.0:
-            return True
-        return _random.random() < th
-
-    if ttype == T_COOLDOWN:
-        hours = int(cfg.get("hours", 0))
-        minutes = int(cfg.get("minutes", 0))
-        cooldown = hours * 3600 + minutes * 60
-        if cooldown <= 0:
-            return True
-        return (now_ts - float(task_last_success or 0.0)) >= cooldown
-
-    return False
+    """被动触发器实时求值（兼容接口）。对主动触发器返回 False（不应被此函数调用）。"""
+    tof, _ = evaluate_passive_trigger(trigger, now_ts, task_last_success)
+    return tof
 
 
 def _window_tof(cfg: Dict[str, Any], now_ts: float) -> bool:
@@ -420,6 +396,101 @@ def _window_tof(cfg: Dict[str, Any], now_ts: float) -> bool:
     else:
         # 跨天区间，如 22:00-06:00，解析为 [22:00, 23:59] ∪ [00:00, 06:00]
         return cur_min >= s_min or cur_min <= e_min
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 触发器结果描述（用于任务内容模板变量 {{id}}）
+# 每种触发器类型生成一段人类可读的"结果说明"，替换 {{1}}/{{2}}/... 占位符。
+# 主动型（interval/cron）带触发时间；被动型（window/random/cooldown）实时求值，
+# 采样与真值在同一处完成，保证 tof 与描述一致（尤其是 random）。
+# ─────────────────────────────────────────────────────────────────────
+
+_WEEKDAY_CN = "一二三四五六日"  # 下标 0=周一 … 6=周日，与 Python weekday() 一致
+
+
+def _fmt_short_time(ts: Optional[float]) -> str:
+    """时间戳 -> YYYY-MM-DD HH:MM（精确到分钟，与描述示例一致）。"""
+    if ts is None:
+        return ""
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+def _fmt_dhms(total_seconds: float) -> str:
+    """秒数 -> 「x天x时x分」；为 0 的高位单位省略，但至少保留最小单位。"""
+    total = max(0, int(total_seconds))
+    d, rem = divmod(total, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    parts: List[str] = []
+    if d:
+        parts.append(f"{d}天")
+    if h:
+        parts.append(f"{h}时")
+    if m or not parts:
+        parts.append(f"{m}分")
+    return "".join(parts)
+
+
+def describe_active_trigger(trigger: Dict[str, Any], fired_point: Optional[float]) -> str:
+    """主动型（interval/cron）触发器的结果描述。fired_point=None 表示本次未到点。"""
+    ttype = trigger.get("type")
+    cfg = trigger.get("config", {}) or {}
+    prefix = "触发了" if fired_point is not None else "未触发"
+    when = _fmt_short_time(fired_point) if fired_point is not None else ""
+
+    if ttype == T_INTERVAL:
+        d = int(cfg.get("days", 0) or 0)
+        h = int(cfg.get("hours", 0) or 0)
+        m = int(cfg.get("minutes", 0) or 0)
+        dur = _fmt_dhms(d * 86400 + h * 3600 + m * 60)
+        return f"{when}{prefix}周期型触发器（周期{dur}）"
+
+    if ttype == T_CRON:
+        expr = str(cfg.get("expr", ""))
+        return f"{when}{prefix}CRON型触发器（{expr}）"
+
+    return f"{when}{prefix}{ttype}触发器"
+
+
+def evaluate_passive_trigger(trigger: Dict[str, Any], now_ts: float, task_last_success: float) -> Tuple[bool, str]:
+    """被动触发器（window/random/cooldown）的实时求值 + 结果描述。
+    返回 (tof, desc)。采样在内部一次完成，确保 tof 与 desc 一致。"""
+    ttype = trigger.get("type")
+    cfg = trigger.get("config", {}) or {}
+
+    if ttype == T_WINDOW:
+        tof = _window_tof(cfg, now_ts)
+        start = str(cfg.get("start", "00:00"))
+        end = str(cfg.get("end", "23:59"))
+        wds = cfg.get("weekdays") or []
+        if wds:
+            day_str = "每周" + "".join(_WEEKDAY_CN[i] for i in sorted(wds) if 0 <= i <= 6)
+        else:
+            day_str = "每天"
+        scope = f"{day_str}{start}-{end}"
+        return tof, f"{'激活了' if tof else '未激活'}区间触发器：{scope}"
+
+    if ttype == T_RANDOM:
+        try:
+            th = float(cfg.get("threshold", 0.0))
+        except (TypeError, ValueError):
+            th = 0.0
+        sample = _random.random()
+        tof = sample < th
+        return tof, f"{'激活了' if tof else '未激活'}随机触发器：{sample:g}<{th:g}"
+
+    if ttype == T_COOLDOWN:
+        hours = int(cfg.get("hours", 0) or 0)
+        minutes = int(cfg.get("minutes", 0) or 0)
+        cooldown = hours * 3600 + minutes * 60
+        elapsed = max(0.0, now_ts - float(task_last_success or 0.0))
+        tof = (elapsed >= cooldown) if cooldown > 0 else True
+        return tof, f"{'激活了' if tof else '未激活'}冷却触发器：距离上次触发{_fmt_dhms(elapsed)}，大于{_fmt_dhms(cooldown)}"
+
+    return False, f"未知触发器类型：{ttype}"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -580,6 +651,7 @@ def evaluate_task(triggers: List[Dict[str, Any]],
         "has_active_fire": bool,            # 是否有主动触发器到点
         "trigger_tof": {id: bool, ...},     # 各触发器本次评估的 ToF（用于日志）
         "fired_points": {id: float, ...},   # 到点主动触发器的触发点时间戳（用于更新 last_fired）
+        "trigger_desc": {id: str, ...},     # 各触发器本次评估的结果描述（用于模板变量 {{id}}）
       }
     """
     result = {
@@ -587,6 +659,7 @@ def evaluate_task(triggers: List[Dict[str, Any]],
         "has_active_fire": False,
         "trigger_tof": {},
         "fired_points": {},
+        "trigger_desc": {},
     }
 
     # 先校验触发器与逻辑表达式；非法则直接返回（不触发）
@@ -622,17 +695,24 @@ def evaluate_task(triggers: List[Dict[str, Any]],
     result["has_active_fire"] = True
     result["fired_points"] = fired_points
 
-    # 构造 tof_map
+    # 构造 tof_map 与 desc_map：主动型按"是否到点"取真值并生成带时间的描述，
+    # 被动型实时求值（采样与描述在同一处完成，保证一致）
     tof_map: Dict[int, bool] = {}
+    desc_map: Dict[int, str] = {}
     for tg in triggers:
         tid = tg["id"]
         ttype = tg.get("type")
         if ttype in ACTIVE_TYPES:
-            tof_map[tid] = tid in fired_points
+            fp = fired_points.get(tid)
+            tof_map[tid] = fp is not None
+            desc_map[tid] = describe_active_trigger(tg, fp)
         else:
-            tof_map[tid] = passive_tof(tg, now_ts, task_last_success)
+            tof, desc = evaluate_passive_trigger(tg, now_ts, task_last_success)
+            tof_map[tid] = tof
+            desc_map[tid] = desc
 
     result["trigger_tof"] = tof_map
+    result["trigger_desc"] = desc_map
     result["should_run"] = eval_logic_expr(logic_expr, tof_map)
     return result
 
@@ -651,6 +731,8 @@ def render_template(text: str, params: Dict[str, Any], now_ts: float) -> str:
       time      -> YYYY-MM-DD HH:MM:SS
       date      -> YYYY-MM-DD
       weekday   -> 周一/周二...
+    触发器结果变量由调用方以字符串 id 作为 key 注入 params（如 {"1": "触发了周期型触发器…"}），
+    对应 {{1}}/{{2}}/... 占位符。
     若 text 不是字符串则原样返回。
     """
     if not isinstance(text, str):

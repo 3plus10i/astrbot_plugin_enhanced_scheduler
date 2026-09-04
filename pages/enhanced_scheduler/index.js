@@ -259,10 +259,12 @@ async function init() {
         card.querySelector(".trigger-type-select").addEventListener("change", e => {
             card.querySelector(".trigger-type-desc").textContent = TYPE_LABELS[e.target.value].desc;
             renderTriggerFields(card, e.target.value, {});
+            renderTemplateVars();
             scheduleValidate();
         });
         card.querySelector(".remove-trigger-btn").addEventListener("click", () => {
             card.remove();
+            renderTemplateVars();
             scheduleValidate();
         });
         card.addEventListener("input", scheduleValidate);
@@ -353,6 +355,7 @@ async function init() {
     $("add-trigger-btn").addEventListener("click", () => {
         const newId = addTriggerRow(null);
         appendLogicFor(newId);
+        renderTemplateVars();
         scheduleValidate();
     });
 
@@ -408,15 +411,15 @@ async function init() {
     const MODE_INFO = {
         fixed: {
             detail: "将下方文本（渲染 {{变量}} 后）直接作为消息发送到目标，不经过 AI。",
-            requirement: "输入要求：要发送的固定消息，支持 {{time}} {{date}} {{weekday}}。",
+            requirement: "输入要求：要发送的固定消息，支持 {{time}} {{date}} {{weekday}} 及触发器结果 {{n}}（n=触发器编号）。",
         },
         standalone: {
             detail: "使用上方「独立 AI 系统提示」作为 system prompt + 下方任务提示词，单独调用 AI 生成回复后发送，不携带对话人格、不与其他插件互动。",
-            requirement: "输入要求：给 AI 的任务提示词（作为 user 消息），支持 {{time}} {{date}} {{weekday}}。",
+            requirement: "输入要求：给 AI 的任务提示词（作为 user 消息），支持 {{time}} {{date}} {{weekday}} 及触发器结果 {{n}}（n=触发器编号）。",
         },
         conversation: {
             detail: "将下方任务提示词交给目标对话配置的 AI 生成回复后发送，会携带该对话的人格 system prompt 及记忆插件注入。",
-            requirement: "输入要求：给 AI 的任务提示词（作为 user 消息），支持 {{time}} {{date}} {{weekday}}。",
+            requirement: "输入要求：给 AI 的任务提示词（作为 user 消息），支持 {{time}} {{date}} {{weekday}} 及触发器结果 {{n}}（n=触发器编号）。",
         },
     };
     function updateContentMode() {
@@ -433,6 +436,29 @@ async function init() {
     $("task-mode").addEventListener("change", updateContentMode);
 
     // ── 模板变量及当前值（点击按钮插入到文本框光标处） ──
+    function triggerResultPreview(type, cfg) {
+        cfg = cfg || {};
+        if (type === "interval") {
+            const d = parseInt(cfg.days) || 0, h = parseInt(cfg.hours) || 0, m = parseInt(cfg.minutes) || 0;
+            return `周期型触发器（周期${d}天${h}时${m}分）`;
+        }
+        if (type === "cron") return `CRON型触发器（${cfg.expr || "…"}）`;
+        if (type === "window") {
+            const wd = Array.isArray(cfg.weekdays) ? cfg.weekdays : [];
+            const cn = ["一", "二", "三", "四", "五", "六", "日"];
+            const scope = wd.length ? "每周" + wd.map(i => cn[i]).join("") : "每天";
+            return `区间触发器：${scope}${cfg.start || "00:00"}-${cfg.end || "23:59"}`;
+        }
+        if (type === "random") {
+            const th = (cfg.threshold != null && isFinite(cfg.threshold)) ? cfg.threshold : 0.5;
+            return `随机触发器：?<${th}`;
+        }
+        if (type === "cooldown") {
+            const h = parseInt(cfg.hours) || 0, m = parseInt(cfg.minutes) || 0;
+            return `冷却触发器：大于${h}时${m}分`;
+        }
+        return "触发器结果";
+    }
     function renderTemplateVars() {
         const now = new Date();
         const p = n => String(n).padStart(2, "0");
@@ -444,6 +470,10 @@ async function init() {
             { k: "date", v: date },
             { k: "weekday", v: weekday },
         ];
+        // 触发器结果变量 {{id}}：按当前已添加的触发器动态生成，点击插入 {{n}}
+        collectTriggers().forEach(tg => {
+            items.push({ k: String(tg.id), v: triggerResultPreview(tg.type, tg.config || {}) });
+        });
         $("template-vars").innerHTML = items.map(it =>
             `<button type="button" class="var-btn" data-tag="{{${it.k}}}"><code>{{${it.k}}}</code><span class="var-value">${escapeHtml(String(it.v))}</span></button>`
         ).join("");
