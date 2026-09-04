@@ -182,22 +182,8 @@ textarea.form-input.disabled, textarea.form-input:disabled { opacity: .55; curso
 .toast.show { transform: translateY(0); opacity: 1; visibility: visible; }
 .toast.error { background: var(--color-danger); color: #fff; }
 
-/* LLM 调用日志查看器 */
-.llm-log-item { border: 1px solid var(--border-color); border-radius: var(--radius-md); margin-bottom: 10px; background: var(--bg-card); overflow: hidden; }
-.llm-log-item-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 12px 16px; cursor: pointer; user-select: none; transition: background .15s; }
-.llm-log-item-head:hover { background: var(--color-primary-light); }
-.llm-log-item-body { border-top: 1px solid var(--border-color); padding: 14px 16px; background: rgba(0,0,0,0.015); }
-html[data-theme="dark"] .llm-log-item-body { background: rgba(255,255,255,0.02); }
-.llm-task { font-weight: 600; font-size: 14px; }
-.llm-meta { font-size: 12px; color: var(--text-secondary); }
-.llm-time { font-size: 12px; color: var(--text-secondary); margin-left: auto; }
-.llm-expand-arrow { color: var(--text-secondary); font-size: 13px; margin-left: 4px; }
-.llm-sub-label { font-size: 12px; font-weight: 700; color: var(--text-secondary); margin: 12px 0 6px; text-transform: uppercase; letter-spacing: .3px; }
-.llm-sub-label:first-child { margin-top: 0; }
-.llm-pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.55; background: var(--bg-app); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 10px 12px; white-space: pre-wrap; word-break: break-word; margin: 0; max-height: 300px; overflow-y: auto; }
-.llm-ctx { margin-bottom: 8px; }
-.llm-ctx-role { display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: var(--radius-pill); background: var(--color-primary-light); color: var(--color-primary); margin-bottom: 4px; }
-.llm-ctx .llm-pre { margin: 0; max-height: 200px; }
+/* LLM 调用日志查看器（原始文件内容） */
+.llm-raw { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.55; background: var(--bg-app); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 14px 16px; white-space: pre-wrap; word-break: break-word; margin: 0; min-height: 200px; max-height: 70vh; overflow-y: auto; color: var(--text-primary); }
 
 
 @media (max-width: 768px) {

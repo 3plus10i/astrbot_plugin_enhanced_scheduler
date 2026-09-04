@@ -91,7 +91,7 @@
                     <div class="card-header">
                         <div class="card-header-title-group">
                             <h2 class="card-title">LLM 调用日志</h2>
-                            <span class="form-hint" style="font-weight:400;">记录每次 AI 任务的完整请求体与回复（独立/对话模式）</span>
+                            <span class="form-hint" style="font-weight:400;">原始文件内容（llm_calls.jsonl），仅供 debug 查看</span>
                         </div>
                         <div style="display:flex;gap:8px;">
                             <button class="btn btn-secondary" id="refresh-llm-btn"><span>刷新</span></button>
@@ -99,10 +99,7 @@
                         </div>
                     </div>
                     <div class="card-body">
-                        <div id="llm-logs-list"><div class="empty-hint">暂无 LLM 调用记录。任务使用「独立 AI / 对话 AI」模式触发后会显示在此。</div></div>
-                        <div id="llm-logs-more" style="text-align:center;margin-top:12px;display:none;">
-                            <button class="btn btn-secondary btn-sm" id="llm-load-more-btn"><span>加载更多</span></button>
-                        </div>
+                        <pre class="llm-raw" id="llm-raw-content">暂无记录。</pre>
                     </div>
                 </div>
             </section>

@@ -118,15 +118,17 @@ WebUI → 插件管理 → 找到「增强计划任务」→ 进入 Pages 页面
 
 每个任务的「独立 AI 系统提示」在任务内容区填写，**任务独立**；新建任务会预填默认提示（<100 字，可自行修改）。
 
-**对话 AI（conversation）调用流程**：
+**对话 AI（conversation）调用流程**（对齐 AstrBot 主 agent 的请求构建）：
 
 1. 取目标 UMO 当前配置的 `chat_provider_id`
-2. 构造 `ProviderRequest(prompt=渲染后文本, system_prompt="", session_id=umo)` 和一个轻量 `_MockEvent`
-3. **广播 `on_llm_request` 给其它所有已加载插件**（人格/记忆插件有机会注入 `system_prompt` 与上下文 `contexts`）
-4. 把注入后的 `system_prompt`、`contexts` 连同 `prompt` 一起调用 `context.llm_generate(chat_provider_id=..., ...)`，超时由 `llm_timeout` 控制
-5. AI 空回复/超时/异常 → 记该目标失败（`ok:false`），**不降级为发送原文**
+2. 取该会话当前 conversation：历史消息 → `contexts`，会话级 `persona_id`
+3. 取该 UMO 的 `provider_settings`（应用 `prompt_prefix`、默认人格）
+4. 经 `persona_manager.resolve_selected_persona` 解析人格，注入 `system_prompt`（含人格指令）与 `begin_dialogs`
+5. 广播 `on_llm_request` 钩子（走框架原生 `call_event_hook`，让记忆等其它插件注入）
+6. 把注入后的 `system_prompt`、`contexts` 连同 `prompt` 一起调用 `context.llm_generate(chat_provider_id=..., ...)`，超时由 `llm_timeout` 控制
+7. AI 空回复/超时/异常 → 记该目标失败（`ok:false`），**不降级为发送原文**
 
-**独立 AI（standalone）调用流程**：不广播 `on_llm_request`，直接用**该任务的 `system_prompt`**（空则用默认提示）+ 任务提示词调用 `context.llm_generate`；`chat_provider_id` 从第一个目标 UMO 的会话配置获取。所有目标共享同一次生成结果（不依赖会话人格）。
+**独立 AI（standalone）调用流程**：不注入人格、不广播 `on_llm_request`，直接用**该任务的 `system_prompt`**（空则用默认提示）+ 任务提示词调用 `context.llm_generate`；`chat_provider_id` 从第一个目标 UMO 的会话配置获取。所有目标共享同一次生成结果（不依赖会话人格）。
 
 > `context.llm_generate` 自 AstrBot v4.5.7 起**强制要求** `chat_provider_id`（keyword-only）。插件通过 `context.get_current_chat_provider_id(umo=...)` 从指定 UMO 的会话配置正确获取，找不到会报失败而不是静默跳过。
 
@@ -184,7 +186,8 @@ default:GroupMessage:xxxxxx
 - 触发器 3（`random`）：`threshold=0.5`
 - 触发器 4（`cooldown`）：`hours=4`
 - 逻辑规则：`1*2*3*4`
-- 内容：`mode=conversation`、`text="现在时间是{{time}}，你被一个随机触发规则唤醒，要给用户发送一条简短的日常消息。要求就像朋友间无聊时的日常闲聊消息或者问候一样。"`
+- 内容：`mode=conversation`、`text="<proactive_trigger>{{time}}：{{1}}，{{2}}，{{3}},{{4}}。你的回复将被直接发送给用户。</proactive_trigger>给用户发送一条简短的日常消息，要求就像朋友间无聊时的日常闲聊消息或者问候一样。"`
+
 - 目标：你的好友/群 UMO
 
 `conversation` 模式会带上当前会话配置的人格 system prompt（通过 `on_llm_request` 广播注入）。若希望 AI 不携带人格、独立生成，改用 `standalone` 模式。
@@ -270,9 +273,9 @@ default:GroupMessage:xxxxxx
 
 说明：
 
-- 记录的是**广播注入后、真正交给 `context.llm_generate` 的最终请求体**——`conversation` 模式在调用前会广播 `on_llm_request`，故 `system_prompt`/`contexts` 已包含人格、记忆等插件注入；`standalone` 模式不广播，`system_prompt` 为该任务自己的提示。
+- 记录的是**广播注入后、真正交给 `context.llm_generate` 的最终请求体**——`conversation` 模式在调用前会注入人格 + 会话历史并广播 `on_llm_request`，故 `system_prompt`/`contexts` 已包含人格、记忆等插件注入；`standalone` 模式不注入人格、不广播，`system_prompt` 为该任务自己的提示。
 - 请求体可能很大（记忆/上下文），故保留条数由 `llm_log_retention` 控制（超限自动裁剪，保留最近 N 条）。
-- WebUI 新增「LLM 调用日志」标签页：可展开查看每条记录的完整请求体与回复，支持刷新、清空、分页加载更多。
+- WebUI 新增「LLM 调用日志」标签页：直接展示 `llm_calls.jsonl` 的**原始文件内容**（不渲染、不自动刷新，纯 debug 查看），支持手动刷新、清空。
 
 ---
 
@@ -312,6 +315,7 @@ astrbot_plugin_enhanced_scheduler/
 | `/preview_next` | POST | 给定触发器列表，返回下次触发时间 |
 | `/trigger_now` | POST | 立即手动触发一次任务（忽略触发规则与启用状态，仅执行内容并发送） |
 | `/get_llm_logs` | GET | 分页读取 `llm_calls.jsonl`（`limit`/`offset`，最新在前） |
+| `/get_llm_logs_raw` | GET | 返回 `llm_calls.jsonl` 原始文件内容（不解析，供 debug 直接查看） |
 | `/clear_llm_logs` | POST | 清空 `llm_calls.jsonl` |
 
 ## 已知限制
@@ -321,7 +325,7 @@ astrbot_plugin_enhanced_scheduler/
 - `cooldown` 依赖**本任务**的 `last_success_time`（各任务独立）。新任务该值为 0，所以新任务首次触发时 `cooldown` 恒为真；"内容留空"空动作视为成功会推进冷却，而"逻辑未通过"（skip）与发送失败不推进冷却
 - 触发时间精度为秒级（自适应调度按最近触发点唤醒，误差在秒级）
 - 跨天 `window` 区间（如 `22:00-06:00`）解析为 `22:00-23:59` ∪ `00:00-06:00` 两段
-- `conversation` 模式的人格注入依赖其它插件实现 `on_llm_request` 钩子；若没有插件注入 `system_prompt`，LLM 收到的是裸 user prompt。`standalone` 模式不广播，恒使用本插件的 system prompt
+- `conversation` 模式由本插件自行解析人格（`persona_manager`）+ 会话历史并广播 `on_llm_request` 钩子；若会话从未创建过对话，则回退到该 UMO 配置里的默认人格，`contexts` 为空。`standalone` 模式不注入人格、不广播，恒使用本插件的 system prompt
 
 ## 版本
 

@@ -21,6 +21,15 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain  # noqa: F4
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Star, Context, register, StarTools
 
+# AstrBot 内部管线工具（对话 AI 模式用于正确构建请求并广播 on_llm_request 钩子）
+# 这些是框架内部路径，跨版本可能变动；导入失败时降级为「不广播钩子」而非崩溃。
+try:
+    from astrbot.core.pipeline.context_utils import call_event_hook as _call_event_hook
+    from astrbot.core.star.star_handler import EventType as _EventType
+except Exception:  # noqa: BLE001
+    _call_event_hook = None
+    _EventType = None
+
 # 确保插件目录在 sys.path 中，以便导入同目录的 scheduler_core
 import os as _os
 import sys as _sys
@@ -35,7 +44,7 @@ LOG_FILE_NAME = "scheduler.log"
 LLM_LOG_FILE_NAME = "llm_calls.jsonl"
 
 # 「独立 AI 回复」模式的默认 system prompt（每个任务可覆盖，新建任务预填此值）
-DEFAULT_STANDALONE_SYSTEM_PROMPT = "<scheduler>这是由计划任务自动触发的一次会话，现在时间是 {{time}}。请根据用户的指令执行任务。</scheduler>";
+DEFAULT_STANDALONE_SYSTEM_PROMPT = "<proactive_trigger>这是由计划任务自动触发的一次会话，现在时间是 {{time}}。请根据用户的指令进行回复。你的回复将被直接发送给用户。</proactive_trigger>";
 
 
 @register(
@@ -362,6 +371,7 @@ class EnhancedSchedulerPlugin(Star):
             if not umo_str:
                 continue
             try:
+                conv_cid = None
                 if mode == "fixed":
                     msg_text = rendered
                 elif mode == "standalone":
@@ -369,7 +379,7 @@ class EnhancedSchedulerPlugin(Star):
                         raise RuntimeError(standalone_error)
                     msg_text = standalone_text
                 else:  # conversation
-                    msg_text, gen_err = await self._llm_generate_for_target(umo_str, rendered, log_ctx)
+                    msg_text, gen_err, conv_cid = await self._llm_generate_for_target(umo_str, rendered, log_ctx)
                     if gen_err:
                         raise RuntimeError(gen_err)
 
@@ -380,6 +390,9 @@ class EnhancedSchedulerPlugin(Star):
 
                 msg = MessageChain().message(msg_text)
                 await self.context.send_message(umo_str, msg)
+                # 对话 AI 模式：把主动回复回写到会话历史，使 AI 记住自己说过的话
+                if mode == "conversation" and conv_cid:
+                    await self._save_assistant_reply(umo_str, conv_cid, msg_text)
                 targets_result.append({"umo": umo_str, "ok": True, "error": ""})
             except Exception as e:
                 targets_result.append({"umo": umo_str, "ok": False, "error": str(e)})
@@ -421,33 +434,82 @@ class EnhancedSchedulerPlugin(Star):
 
     async def _llm_generate_for_target(self, umo: str, user_prompt: str, log_ctx: Optional[dict] = None) -> tuple:
         """
-        以目标会话 umo 的当前配置（人格/记忆通过 on_llm_request 钩子注入）调用 LLM 生成回复。
-        返回 (text, error)：error 为空表示成功，非空表示失败。
-        借鉴 instant_memo 的框架级管线做法：构造 ProviderRequest 并广播 on_llm_request，
-        使人格/记忆等插件有机会注入 system_prompt 与上下文。
+        以目标会话 umo 的当前配置调用 LLM 生成回复。
+
+        正确复制 AstrBot 主 agent 的请求构建流程（_decorate_llm_request 的关键部分）：
+          1. 取该 UMO 的 chat_provider_id
+          2. 取会话当前 conversation（历史 contexts + 会话级 persona_id）
+          3. 取该 UMO 的 provider_settings（prompt_prefix / 默认人格）
+          4. 经 persona_manager 解析人格，注入 system_prompt 与 begin_dialogs
+          5. 广播 on_llm_request 钩子，让记忆等其它插件注入
+          6. 调用 context.llm_generate
         每次调用都会把「最终发送给 AI 的完整请求体」与「AI 回复」写入 llm_calls.jsonl。
+
+        返回 (text, error, cid)：error 为空表示成功，非空表示失败；cid 为目标会话当前
+        对话 ID（供调用方在发送成功后把 assistant 回复回写到会话历史）。
         """
         t0 = time.time()
-        # 必须正确获取该 UMO 当前使用的聊天模型 provider id，llm_generate 强制要求
+        cid: Optional[str] = None
+
+        def _fail(msg: str) -> tuple:
+            logger.error(f"[EnhancedScheduler] {msg} umo={umo}")
+            return "", msg, cid
+
+        # 1) provider id
         try:
             provider_id = await self.context.get_current_chat_provider_id(umo=umo)
         except Exception as e:
             msg = f"获取会话聊天模型失败: {e}"
-            logger.error(f"[EnhancedScheduler] {msg} umo={umo}")
             await self._log_llm_call(log_ctx, umo, "conversation", None, None, msg, t0)
-            return "", msg
+            return _fail(msg)
         if not provider_id:
             msg = "会话未配置聊天模型 provider"
-            logger.error(f"[EnhancedScheduler] {msg} umo={umo}")
             await self._log_llm_call(log_ctx, umo, "conversation", None, None, msg, t0)
-            return "", msg
+            return _fail(msg)
 
-        # 构造一个轻量的事件对象供 on_llm_request 钩子读取会话信息
-        mock_event = _MockEvent(umo)
+        # 2) 会话 conversation（历史 + 会话级 persona_id）
+        conversation = None
+        try:
+            cm = self.context.conversation_manager
+            cid = await cm.get_curr_conversation_id(umo)
+            if cid:
+                conversation = await cm.get_conversation(umo, cid)
+        except Exception as e:
+            logger.warning(f"[EnhancedScheduler] 获取会话历史失败: {e}")
+
+        # 3) provider_settings 配置
+        cfg: Dict[str, Any] = {}
+        try:
+            cfg = self.context.get_config(umo=umo).get("provider_settings", {}) or {}
+        except Exception:
+            cfg = {}
+
         req = ProviderRequest(prompt=user_prompt, system_prompt="", session_id=umo)
+        if conversation is not None:
+            req.conversation = conversation
+            history = getattr(conversation, "history", None)
+            if history:
+                try:
+                    hist = json.loads(history)
+                    if isinstance(hist, list):
+                        req.contexts = hist
+                except Exception:
+                    pass
 
-        # 广播 on_llm_request 给其它插件（注入人格/记忆）；每个插件独立 try，互不影响
-        await self._broadcast_on_llm_request(mock_event, req)
+        # 4) prompt prefix
+        prefix = cfg.get("prompt_prefix")
+        if prefix:
+            if "{{prompt}}" in prefix:
+                req.prompt = prefix.replace("{{prompt}}", req.prompt)
+            else:
+                req.prompt = f"{prefix}{req.prompt}"
+
+        # 5) 人格（persona system_prompt + begin_dialogs）
+        await self._apply_persona(req, cfg, umo, conversation)
+
+        # 6) 广播 on_llm_request 钩子（其它插件注入）
+        event = _MockEvent(umo)
+        await self._broadcast_on_llm_request(event, req)
 
         # 最终请求体（广播后 system_prompt / contexts / model 可能已被插件注入）
         request_body = {
@@ -463,7 +525,6 @@ class EnhancedSchedulerPlugin(Star):
             "prompt": req.prompt,
             "system_prompt": req.system_prompt or "",
         }
-        # 把广播注入的上下文一并传给 LLM，保证日志记录与实际发送一致
         if req.contexts:
             kwargs["contexts"] = req.contexts
         model = getattr(req, "model", None)
@@ -477,19 +538,125 @@ class EnhancedSchedulerPlugin(Star):
             )
             if resp and getattr(resp, "completion_text", None):
                 await self._log_llm_call(log_ctx, umo, "conversation", request_body, resp, None, t0)
-                return str(resp.completion_text).strip(), ""
+                return str(resp.completion_text).strip(), "", cid
             await self._log_llm_call(log_ctx, umo, "conversation", request_body, None, "AI 生成结果为空", t0)
-            return "", "AI 生成结果为空"
+            return "", "AI 生成结果为空", cid
         except asyncio.TimeoutError:
             msg = f"AI 生成超时({self._llm_timeout()}s)"
             logger.warning(f"[EnhancedScheduler] {msg} umo={umo}")
             await self._log_llm_call(log_ctx, umo, "conversation", request_body, None, msg, t0)
-            return "", msg
+            return "", msg, cid
         except Exception as e:
             msg = f"AI 生成失败: {e}"
             logger.error(f"[EnhancedScheduler] {msg} umo={umo}")
             await self._log_llm_call(log_ctx, umo, "conversation", request_body, None, msg, t0)
-            return "", msg
+            return "", msg, cid
+
+    async def _save_assistant_reply(self, umo: str, cid: str, reply_text: str) -> bool:
+        """把主动回复回写到目标会话的对话历史，使对话 AI 记住自己说过的话。
+
+        主动触发（conversation 模式）没有真实的用户消息事件，主 agent 不会代为保存
+        历史，因此需要插件自行把这条 assistant 消息追加到 conversation.history。
+        消息格式与主 agent 的 dump_messages_with_checkpoints 一致：
+        {"role": "assistant", "content": [{"type": "text", "text": ...}]}
+        """
+        if not cid or not reply_text:
+            return False
+        try:
+            cm = self.context.conversation_manager
+            # 重新读取最新历史再追加，避免覆盖并发新增的消息
+            conv = await cm.get_conversation(umo, cid)
+            if conv is None:
+                return False
+            try:
+                history = json.loads(conv.history) if conv.history else []
+            except Exception:
+                history = []
+            if not isinstance(history, list):
+                history = []
+            history.append({"role": "assistant", "content": [{"type": "text", "text": reply_text}]})
+            await cm.update_conversation(umo, cid, history=history)
+            return True
+        except Exception as e:
+            logger.warning(f"[EnhancedScheduler] 写入会话历史失败: {e}")
+            return False
+
+    async def _apply_persona(self, req: ProviderRequest, cfg: dict, umo: str, conversation) -> None:
+        """复制主 agent 的人格注入：把当前会话人格的 system prompt 与开场白写入请求。
+
+        逻辑对齐 astr_main_agent._ensure_persona_and_skills 的核心部分（不含 skills/tools）。
+        """
+        try:
+            persona_mgr = getattr(self.context, "persona_manager", None)
+            if persona_mgr is None or not hasattr(persona_mgr, "resolve_selected_persona"):
+                return
+            platform_name = _platform_name_from_umo(umo)
+            conv_persona_id = getattr(conversation, "persona_id", None) if conversation is not None else None
+            _, persona, _, _ = await persona_mgr.resolve_selected_persona(
+                umo=umo,
+                conversation_persona_id=conv_persona_id,
+                platform_name=platform_name,
+                provider_settings=cfg,
+            )
+            if not persona:
+                return
+            if req.system_prompt is None:
+                req.system_prompt = ""
+            prompt = persona.get("prompt") if isinstance(persona, dict) else getattr(persona, "prompt", None)
+            if prompt:
+                req.system_prompt += f"\n# Persona Instructions\n\n{prompt}\n"
+            begin_dialogs = persona.get("_begin_dialogs_processed") if isinstance(persona, dict) else getattr(persona, "_begin_dialogs_processed", None)
+            if begin_dialogs:
+                try:
+                    req.contexts = list(begin_dialogs) + list(req.contexts or [])
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"[EnhancedScheduler] 注入人格失败: {e}")
+
+    async def _broadcast_on_llm_request(self, event, req: ProviderRequest):
+        """广播 on_llm_request 钩子给其它已加载插件（人格/记忆等注入）。
+
+        优先走框架原生的 call_event_hook（正确按注册表/优先级/启用状态分发）；
+        若内部 API 不可用则退化为手动遍历（尽力而为）。
+        """
+        if _call_event_hook is not None and _EventType is not None:
+            try:
+                await _call_event_hook(event, _EventType.OnLLMRequestEvent, req)
+                return
+            except Exception as e:
+                logger.debug(f"[EnhancedScheduler] call_event_hook 失败，退回手动广播: {e}")
+        # 兜底：手动遍历已加载插件
+        stars = []
+        try:
+            sm = getattr(self.context, "star_map", None)
+            if isinstance(sm, dict):
+                stars = list(sm.values())
+        except Exception:
+            pass
+        if not stars:
+            pm = getattr(self.context, "plugin_manager", None)
+            if pm and hasattr(pm, "plugins"):
+                try:
+                    stars = list(pm.plugins.values())
+                except Exception:
+                    stars = []
+
+        for star in stars:
+            if star is self:
+                continue
+            try:
+                handler = getattr(star, "on_llm_request", None)
+                if handler is None:
+                    continue
+                if not _is_on_llm_request_hook(handler):
+                    continue
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(event, req)
+                else:
+                    handler(event, req)
+            except Exception as e:
+                logger.debug(f"[EnhancedScheduler] 广播 on_llm_request 跳过某插件: {e}")
 
     async def _llm_generate_standalone(self, umo: str, user_prompt: str, system_prompt: str, log_ctx: Optional[dict] = None) -> tuple:
         """
@@ -546,41 +713,6 @@ class EnhancedSchedulerPlugin(Star):
             logger.error(f"[EnhancedScheduler] {msg}")
             await self._log_llm_call(log_ctx, umo, "standalone", request_body, None, msg, t0)
             return "", msg
-
-    async def _broadcast_on_llm_request(self, event, req: ProviderRequest):
-        """遍历已加载插件，调用其 on_llm_request 钩子以注入 system_prompt / 记忆。"""
-        stars = []
-        try:
-            sm = getattr(self.context, "star_map", None)
-            if isinstance(sm, dict):
-                stars = list(sm.values())
-        except Exception:
-            pass
-        if not stars:
-            pm = getattr(self.context, "plugin_manager", None)
-            if pm and hasattr(pm, "plugins"):
-                try:
-                    stars = list(pm.plugins.values())
-                except Exception:
-                    stars = []
-
-        for star in stars:
-            if star is self:
-                continue
-            # 优先尝试插件层暴露的统一钩子分发（若存在）
-            try:
-                handler = getattr(star, "on_llm_request", None)
-                if handler is None:
-                    continue
-                # 只调用确实被 AstrBot 注册为 on_llm_request 钩子的方法
-                if not _is_on_llm_request_hook(handler):
-                    continue
-                if asyncio.iscoroutinefunction(handler):
-                    await handler(event, req)
-                else:
-                    handler(event, req)
-            except Exception as e:
-                logger.debug(f"[EnhancedScheduler] 广播 on_llm_request 跳过某插件: {e}")
 
     # ─────────────────────────────────────────────────────────────
     # 日志
@@ -646,6 +778,19 @@ class EnhancedSchedulerPlugin(Star):
         except Exception as e:
             logger.error(f"[EnhancedScheduler] 读取 LLM 日志失败: {e}")
         return entries
+
+    def _read_llm_logs_raw_io(self) -> str:
+        """按原样读取 llm_calls.jsonl 的原始文件内容（不解析、不渲染，供 debug 直接查看）。"""
+        try:
+            if not os.path.exists(self.llm_log_file):
+                return ""
+            with open(self.llm_log_file, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            lines.reverse()
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error(f"[EnhancedScheduler] 读取 LLM 原始日志失败: {e}")
+            return ""
 
     def _clear_llm_logs_io(self):
         try:
@@ -720,6 +865,7 @@ class EnhancedSchedulerPlugin(Star):
         self.context.register_web_api(f"{prefix}/preview_next", self._api_preview_next, ["POST"], "预览下次触发时间")
         self.context.register_web_api(f"{prefix}/trigger_now", self._api_trigger_now, ["POST"], "立即手动触发一次任务")
         self.context.register_web_api(f"{prefix}/get_llm_logs", self._api_get_llm_logs, ["GET"], "获取 LLM 调用日志")
+        self.context.register_web_api(f"{prefix}/get_llm_logs_raw", self._api_get_llm_logs_raw, ["GET"], "获取 LLM 调用日志原始文件内容")
         self.context.register_web_api(f"{prefix}/clear_llm_logs", self._api_clear_llm_logs, ["POST"], "清空 LLM 调用日志")
 
     # ─────────────────────────────────────────────────────────────
@@ -1097,6 +1243,15 @@ class EnhancedSchedulerPlugin(Star):
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
 
+    async def _api_get_llm_logs_raw(self):
+        """返回 llm_calls.jsonl 的原始文件内容（不解析、不渲染，供 debug 直接查看）。"""
+        from quart import jsonify
+        try:
+            content = await asyncio.to_thread(self._read_llm_logs_raw_io)
+            return jsonify({"status": "success", "content": content})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
 
 # ─────────────────────────────────────────────────────────────────────
 # 辅助类与函数
@@ -1155,14 +1310,29 @@ def _json_safe(obj):
         return repr(obj)
 
 
+def _platform_name_from_umo(umo: str) -> str:
+    """从 unified_msg_origin（platform_name:message_type:session_id）取平台名。"""
+    try:
+        return str(umo).split(":")[0]
+    except Exception:
+        return ""
+
+
 class _MockEvent:
-    """轻量事件对象，供 on_llm_request 钩子读取会话信息（定时触发无真实事件）。"""
+    """轻量事件对象，供 on_llm_request 钩子读取会话信息（定时触发无真实事件）。
+
+    尽量对齐 AstrMessageEvent 的常用接口，使 call_event_hook 与各钩子能正常读取：
+    unified_msg_origin / plugins_name / is_stopped() / get_platform_name() / get_platform_id()。
+    """
 
     def __init__(self, umo: str):
         self.unified_msg_origin = umo
+        self.session_id = umo.split(":")[-1] if ":" in umo else umo
         self.message_str = ""
         self.message_obj = None
+        self.plugins_name: Optional[List[str]] = None
         self._extra: Dict[str, Any] = {}
+        self._stopped = False
 
     def get_extra(self, key, default=None):
         return self._extra.get(key, default)
@@ -1178,6 +1348,18 @@ class _MockEvent:
 
     def get_group_id(self):
         return ""
+
+    def get_platform_name(self):
+        return _platform_name_from_umo(self.unified_msg_origin)
+
+    def get_platform_id(self):
+        return ""
+
+    def is_stopped(self):
+        return self._stopped
+
+    def stop_event(self):
+        self._stopped = True
 
 
 def _is_on_llm_request_hook(handler) -> bool:
