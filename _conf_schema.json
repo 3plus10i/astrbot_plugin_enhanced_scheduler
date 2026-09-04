@@ -1,0 +1,23 @@
+{
+  "poll_interval": {
+    "type": "int",
+    "description": "兜底轮询间隔(秒)",
+    "hint": "仅在任务不含主动触发器或调度计算失败时生效。正常时调度器按最近触发点自适应唤醒，不受此值影响。默认 60 秒。",
+    "obvious_hint": true,
+    "default": 60
+  },
+  "log_retention": {
+    "type": "int",
+    "description": "日志保留条数",
+    "hint": "内存中保留最近多少条触发/执行日志，供配置页面查看。默认 200 条。",
+    "obvious_hint": true,
+    "default": 200
+  },
+  "llm_timeout": {
+    "type": "int",
+    "description": "AI 生成超时(秒)",
+    "hint": "任务内容标记为需要 AI 处理时，单次生成的最大等待时长。超时则记为失败。默认 60 秒。",
+    "obvious_hint": true,
+    "default": 60
+  }
+}
