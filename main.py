@@ -32,6 +32,7 @@ import scheduler_core as core
 PLUGIN_NAME = "astrbot_plugin_enhanced_scheduler"
 DATA_FILE_NAME = "tasks.json"
 LOG_FILE_NAME = "scheduler.log"
+LLM_LOG_FILE_NAME = "llm_calls.jsonl"
 
 # 「独立 AI 回复」模式的默认 system prompt（每个任务可覆盖，新建任务预填此值）
 DEFAULT_STANDALONE_SYSTEM_PROMPT = "<scheduler>这是由计划任务自动触发的一次会话，现在时间是 {{time}}。请根据用户的指令执行任务。</scheduler>";
@@ -52,6 +53,16 @@ class EnhancedSchedulerPlugin(Star):
         self.data_dir = str(StarTools.get_data_dir(PLUGIN_NAME))
         os.makedirs(self.data_dir, exist_ok=True)
         self.data_file = os.path.join(self.data_dir, DATA_FILE_NAME)
+
+        # LLM 调用日志（独立文件，append-only JSONL）
+        self.llm_log_file = os.path.join(self.data_dir, LLM_LOG_FILE_NAME)
+        self._llm_log_count = 0
+        try:
+            if os.path.exists(self.llm_log_file):
+                with open(self.llm_log_file, "r", encoding="utf-8") as f:
+                    self._llm_log_count = sum(1 for _ in f)
+        except Exception:
+            self._llm_log_count = 0
 
         # 并发安全锁
         self._lock = asyncio.Lock()
@@ -117,6 +128,13 @@ class EnhancedSchedulerPlugin(Star):
             return max(5, v)
         except (TypeError, ValueError):
             return 60
+
+    def _llm_log_retention(self) -> int:
+        try:
+            v = int(self.config.get("llm_log_retention", 500))
+            return max(50, v)
+        except (TypeError, ValueError):
+            return 500
 
     def _standalone_prompt(self, content: dict) -> str:
         """解析独立 AI 模式的 system prompt（任务级，空则回退默认）。"""
@@ -291,7 +309,7 @@ class EnhancedSchedulerPlugin(Star):
     # 任务执行
     # ─────────────────────────────────────────────────────────────
 
-    async def _execute_task(self, task: dict, now: float, trigger_desc: Optional[dict] = None):
+    async def _execute_task(self, task: dict, now: float, trigger_desc: Optional[dict] = None, source: str = "scheduled"):
         """
         执行任务内容并发送。返回 (action, targets_result, detail, success)。
         action: "send_fixed" | "send_llm" | "noop" | "partial" | "failed"
@@ -300,11 +318,18 @@ class EnhancedSchedulerPlugin(Star):
                  任一部分失败即视为失败（不静默降级为直接发送）。
         trigger_desc: {id: str} 各触发器结果描述（用于模板变量 {{id}}）；
                       自动触发由 evaluate_task 提供，手动触发时缺省则由本方法兜底生成。
+        source: "scheduled"（自动）或 "manual"（手动触发），用于 LLM 日志标注。
         """
         content = task.get("content", {})
         text = str(content.get("text", "") or "")
         mode = _resolve_mode(content)
         targets = task.get("targets", []) or []
+
+        log_ctx = {
+            "task_id": str(task.get("id", "")),
+            "task_name": str(task.get("name", "")),
+            "source": source,
+        }
 
         # 空动作（内容留空）：视为成功执行了目标动作（推进冷却），仅记日志不发送
         if not text.strip():
@@ -326,7 +351,7 @@ class EnhancedSchedulerPlugin(Star):
         if mode == "standalone":
             first_umo = str(targets[0]).strip()
             standalone_text, standalone_error = await self._llm_generate_standalone(
-                first_umo, rendered, self._standalone_prompt(content)
+                first_umo, rendered, self._standalone_prompt(content), log_ctx
             )
 
         targets_result: List[Dict[str, Any]] = []
@@ -344,7 +369,7 @@ class EnhancedSchedulerPlugin(Star):
                         raise RuntimeError(standalone_error)
                     msg_text = standalone_text
                 else:  # conversation
-                    msg_text, gen_err = await self._llm_generate_for_target(umo_str, rendered)
+                    msg_text, gen_err = await self._llm_generate_for_target(umo_str, rendered, log_ctx)
                     if gen_err:
                         raise RuntimeError(gen_err)
 
@@ -394,23 +419,27 @@ class EnhancedSchedulerPlugin(Star):
                 desc[str(tid)] = d
         return desc
 
-    async def _llm_generate_for_target(self, umo: str, user_prompt: str) -> tuple:
+    async def _llm_generate_for_target(self, umo: str, user_prompt: str, log_ctx: Optional[dict] = None) -> tuple:
         """
         以目标会话 umo 的当前配置（人格/记忆通过 on_llm_request 钩子注入）调用 LLM 生成回复。
         返回 (text, error)：error 为空表示成功，非空表示失败。
         借鉴 instant_memo 的框架级管线做法：构造 ProviderRequest 并广播 on_llm_request，
         使人格/记忆等插件有机会注入 system_prompt 与上下文。
+        每次调用都会把「最终发送给 AI 的完整请求体」与「AI 回复」写入 llm_calls.jsonl。
         """
+        t0 = time.time()
         # 必须正确获取该 UMO 当前使用的聊天模型 provider id，llm_generate 强制要求
         try:
             provider_id = await self.context.get_current_chat_provider_id(umo=umo)
         except Exception as e:
             msg = f"获取会话聊天模型失败: {e}"
             logger.error(f"[EnhancedScheduler] {msg} umo={umo}")
+            await self._log_llm_call(log_ctx, umo, "conversation", None, None, msg, t0)
             return "", msg
         if not provider_id:
             msg = "会话未配置聊天模型 provider"
             logger.error(f"[EnhancedScheduler] {msg} umo={umo}")
+            await self._log_llm_call(log_ctx, umo, "conversation", None, None, msg, t0)
             return "", msg
 
         # 构造一个轻量的事件对象供 on_llm_request 钩子读取会话信息
@@ -420,11 +449,23 @@ class EnhancedSchedulerPlugin(Star):
         # 广播 on_llm_request 给其它插件（注入人格/记忆）；每个插件独立 try，互不影响
         await self._broadcast_on_llm_request(mock_event, req)
 
+        # 最终请求体（广播后 system_prompt / contexts / model 可能已被插件注入）
+        request_body = {
+            "provider_id": provider_id,
+            "model": getattr(req, "model", None),
+            "system_prompt": req.system_prompt or "",
+            "contexts": req.contexts or [],
+            "prompt": req.prompt or user_prompt,
+        }
+
         kwargs: Dict[str, Any] = {
             "chat_provider_id": provider_id,
             "prompt": req.prompt,
             "system_prompt": req.system_prompt or "",
         }
+        # 把广播注入的上下文一并传给 LLM，保证日志记录与实际发送一致
+        if req.contexts:
+            kwargs["contexts"] = req.contexts
         model = getattr(req, "model", None)
         if model:
             kwargs["model"] = model
@@ -435,35 +476,51 @@ class EnhancedSchedulerPlugin(Star):
                 timeout=self._llm_timeout(),
             )
             if resp and getattr(resp, "completion_text", None):
+                await self._log_llm_call(log_ctx, umo, "conversation", request_body, resp, None, t0)
                 return str(resp.completion_text).strip(), ""
+            await self._log_llm_call(log_ctx, umo, "conversation", request_body, None, "AI 生成结果为空", t0)
             return "", "AI 生成结果为空"
         except asyncio.TimeoutError:
             msg = f"AI 生成超时({self._llm_timeout()}s)"
             logger.warning(f"[EnhancedScheduler] {msg} umo={umo}")
+            await self._log_llm_call(log_ctx, umo, "conversation", request_body, None, msg, t0)
             return "", msg
         except Exception as e:
             msg = f"AI 生成失败: {e}"
             logger.error(f"[EnhancedScheduler] {msg} umo={umo}")
+            await self._log_llm_call(log_ctx, umo, "conversation", request_body, None, msg, t0)
             return "", msg
 
-    async def _llm_generate_standalone(self, umo: str, user_prompt: str, system_prompt: str) -> tuple:
+    async def _llm_generate_standalone(self, umo: str, user_prompt: str, system_prompt: str, log_ctx: Optional[dict] = None) -> tuple:
         """
         独立 AI 模式：使用任务自己的 system prompt + 任务提示词单独调用 LLM。
         不广播 on_llm_request，因此不注入对话人格、也不与其它插件互动。
         但 chat_provider_id 仍需从指定 UMO 的会话配置正确获取。
         返回 (text, error)：error 为空表示成功，非空表示失败。
+        每次调用都会把「最终发送给 AI 的完整请求体」与「AI 回复」写入 llm_calls.jsonl。
         """
+        t0 = time.time()
         # 必须正确获取聊天模型 provider id，llm_generate 强制要求
         try:
             provider_id = await self.context.get_current_chat_provider_id(umo=umo)
         except Exception as e:
             msg = f"获取会话聊天模型失败: {e}"
             logger.error(f"[EnhancedScheduler] {msg} umo={umo}")
+            await self._log_llm_call(log_ctx, umo, "standalone", None, None, msg, t0)
             return "", msg
         if not provider_id:
             msg = "会话未配置聊天模型 provider"
             logger.error(f"[EnhancedScheduler] {msg} umo={umo}")
+            await self._log_llm_call(log_ctx, umo, "standalone", None, None, msg, t0)
             return "", msg
+
+        request_body = {
+            "provider_id": provider_id,
+            "model": None,
+            "system_prompt": system_prompt,
+            "contexts": [],
+            "prompt": user_prompt,
+        }
 
         try:
             resp = await asyncio.wait_for(
@@ -475,15 +532,19 @@ class EnhancedSchedulerPlugin(Star):
                 timeout=self._llm_timeout(),
             )
             if resp and getattr(resp, "completion_text", None):
+                await self._log_llm_call(log_ctx, umo, "standalone", request_body, resp, None, t0)
                 return str(resp.completion_text).strip(), ""
+            await self._log_llm_call(log_ctx, umo, "standalone", request_body, None, "独立 AI 生成结果为空", t0)
             return "", "独立 AI 生成结果为空"
         except asyncio.TimeoutError:
             msg = f"独立 AI 生成超时({self._llm_timeout()}s)"
             logger.warning(f"[EnhancedScheduler] {msg}")
+            await self._log_llm_call(log_ctx, umo, "standalone", request_body, None, msg, t0)
             return "", msg
         except Exception as e:
             msg = f"独立 AI 生成失败: {e}"
             logger.error(f"[EnhancedScheduler] {msg}")
+            await self._log_llm_call(log_ctx, umo, "standalone", request_body, None, msg, t0)
             return "", msg
 
     async def _broadcast_on_llm_request(self, event, req: ProviderRequest):
@@ -534,6 +595,116 @@ class EnhancedSchedulerPlugin(Star):
             del logs[: len(logs) - retention]
 
     # ─────────────────────────────────────────────────────────────
+    # LLM 调用日志（独立文件，记录完整请求体与回复）
+    # ─────────────────────────────────────────────────────────────
+
+    async def _append_llm_log(self, entry: dict):
+        """向 llm_calls.jsonl 追加一条记录（append-only）。"""
+        async with self._lock:
+            await asyncio.to_thread(self._append_llm_log_io, entry)
+
+    def _append_llm_log_io(self, entry: dict):
+        try:
+            line = json.dumps(entry, ensure_ascii=False)
+            with open(self.llm_log_file, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            self._llm_log_count += 1
+            retention = self._llm_log_retention()
+            # 超过 2 倍保留量才裁剪一次，摊销重写开销
+            if self._llm_log_count > retention * 2:
+                self._trim_llm_log_io(retention)
+        except Exception as e:
+            logger.error(f"[EnhancedScheduler] 写入 LLM 日志失败: {e}")
+
+    def _trim_llm_log_io(self, retention: int):
+        try:
+            with open(self.llm_log_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > retention:
+                tmp = self.llm_log_file + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-retention:])
+                os.replace(tmp, self.llm_log_file)
+            self._llm_log_count = min(self._llm_log_count, retention)
+        except Exception as e:
+            logger.error(f"[EnhancedScheduler] 裁剪 LLM 日志失败: {e}")
+
+    def _read_llm_logs_io(self) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        try:
+            if not os.path.exists(self.llm_log_file):
+                return entries
+            with open(self.llm_log_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.error(f"[EnhancedScheduler] 读取 LLM 日志失败: {e}")
+        return entries
+
+    def _clear_llm_logs_io(self):
+        try:
+            with open(self.llm_log_file, "w", encoding="utf-8") as f:
+                pass
+            self._llm_log_count = 0
+        except Exception as e:
+            logger.error(f"[EnhancedScheduler] 清空 LLM 日志失败: {e}")
+
+    def _serialize_llm_response(self, resp) -> Optional[Dict[str, Any]]:
+        """把 LLMResponse 转成可 JSON 序列化的字典（不含原始 raw_completion）。"""
+        if resp is None:
+            return None
+        body: Dict[str, Any] = {
+            "role": getattr(resp, "role", "") or "",
+            "completion_text": getattr(resp, "completion_text", "") or "",
+            "reasoning_content": getattr(resp, "reasoning_content", "") or "",
+        }
+        u = getattr(resp, "usage", None)
+        if u is not None:
+            body["usage"] = {
+                "input": int(getattr(u, "input", 0) or 0),
+                "output": int(getattr(u, "output", 0) or 0),
+                "total": int(getattr(u, "total", 0) or 0),
+            }
+        return body
+
+    async def _log_llm_call(
+        self,
+        log_ctx: Optional[dict],
+        umo: str,
+        mode: str,
+        request_body: Optional[dict],
+        resp,
+        error: Optional[str],
+        t0: float,
+    ):
+        """写入一条 LLM 调用日志（成功与失败都记录）。"""
+        try:
+            now_ts = time.time()
+            entry = {
+                "ts": now_ts,
+                "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts)),
+                "task_id": (log_ctx or {}).get("task_id", ""),
+                "task_name": (log_ctx or {}).get("task_name", ""),
+                "source": (log_ctx or {}).get("source", "scheduled"),
+                "mode": mode,
+                "umo": umo,
+                "ok": error is None,
+                "duration_ms": int((now_ts - t0) * 1000),
+                "request": _json_safe(request_body) if request_body is not None else None,
+                "response": self._serialize_llm_response(resp),
+                "error": error,
+            }
+            await self._append_llm_log(entry)
+        except Exception as e:
+            logger.error(f"[EnhancedScheduler] 记录 LLM 日志失败: {e}")
+
+    # ─────────────────────────────────────────────────────────────
     # Web API 注册
     # ─────────────────────────────────────────────────────────────
 
@@ -548,6 +719,8 @@ class EnhancedSchedulerPlugin(Star):
         self.context.register_web_api(f"{prefix}/validate", self._api_validate, ["POST"], "校验触发器与逻辑规则")
         self.context.register_web_api(f"{prefix}/preview_next", self._api_preview_next, ["POST"], "预览下次触发时间")
         self.context.register_web_api(f"{prefix}/trigger_now", self._api_trigger_now, ["POST"], "立即手动触发一次任务")
+        self.context.register_web_api(f"{prefix}/get_llm_logs", self._api_get_llm_logs, ["GET"], "获取 LLM 调用日志")
+        self.context.register_web_api(f"{prefix}/clear_llm_logs", self._api_clear_llm_logs, ["POST"], "清空 LLM 调用日志")
 
     # ─────────────────────────────────────────────────────────────
     # Web API 实现
@@ -877,7 +1050,7 @@ class EnhancedSchedulerPlugin(Star):
                 return jsonify({"status": "error", "message": "任务不存在"}), 404
             task = tasks[task_id]
             now = time.time()
-            action, targets_result, detail, success = await self._execute_task(task, now)
+            action, targets_result, detail, success = await self._execute_task(task, now, source="manual")
             if success:
                 task["last_success_time"] = now
             self._append_log({
@@ -893,6 +1066,34 @@ class EnhancedSchedulerPlugin(Star):
             })
             await self._save_data()
             return jsonify({"status": "success", "action": action, "detail": detail})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    async def _api_get_llm_logs(self):
+        """分页读取 llm_calls.jsonl（最新在前）。支持 query 参数 limit / offset。"""
+        from quart import request, jsonify
+        try:
+            limit = int(request.args.get("limit", 200))
+            offset = int(request.args.get("offset", 0))
+        except (TypeError, ValueError):
+            limit, offset = 200, 0
+        limit = max(1, min(limit, 2000))
+        offset = max(0, offset)
+        try:
+            entries = await asyncio.to_thread(self._read_llm_logs_io)
+            entries.reverse()  # 最新在前
+            total = len(entries)
+            page = entries[offset : offset + limit]
+            return jsonify({"status": "success", "total": total, "entries": page})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    async def _api_clear_llm_logs(self):
+        """清空 llm_calls.jsonl。"""
+        from quart import jsonify
+        try:
+            await asyncio.to_thread(self._clear_llm_logs_io)
+            return jsonify({"status": "success"})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -918,6 +1119,40 @@ def _resolve_mode(content) -> str:
     if content.get("use_llm"):
         return MODE_CONVERSATION
     return MODE_FIXED
+
+
+def _json_safe(obj):
+    """递归地把任意对象转成 JSON 可序列化的结构（dict/list/基本类型），其余退化为字符串。"""
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    try:
+        import dataclasses
+
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            return _json_safe(dataclasses.asdict(obj))
+    except Exception:
+        pass
+    # pydantic BaseModel（如 astrbot 的 Message）
+    dump = getattr(obj, "model_dump", None)
+    if callable(dump):
+        try:
+            return _json_safe(dump())
+        except Exception:
+            pass
+    d = getattr(obj, "dict", None)
+    if callable(d):
+        try:
+            return _json_safe(d())
+        except Exception:
+            pass
+    try:
+        return str(obj)
+    except Exception:
+        return repr(obj)
 
 
 class _MockEvent:

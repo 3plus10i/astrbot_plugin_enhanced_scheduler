@@ -32,6 +32,7 @@ WebUI → 插件管理 → 找到「增强计划任务」→ 进入 Pages 页面
 | `poll_interval` | int | 60 | 兜底轮询间隔（秒）。仅在无主动触发器或调度计算失败时生效；正常时按最近触发点自适应唤醒，不受此值影响 |
 | `log_retention` | int | 200 | 内存中保留最近多少条触发/执行日志。最小 10 |
 | `llm_timeout` | int | 60 | AI 单次生成超时（秒）。最小 5 |
+| `llm_log_retention` | int | 500 | 独立文件 `llm_calls.jsonl` 保留最近多少条 AI 调用记录（含完整请求体）。最小 50 |
 
 ---
 
@@ -121,8 +122,8 @@ WebUI → 插件管理 → 找到「增强计划任务」→ 进入 Pages 页面
 
 1. 取目标 UMO 当前配置的 `chat_provider_id`
 2. 构造 `ProviderRequest(prompt=渲染后文本, system_prompt="", session_id=umo)` 和一个轻量 `_MockEvent`
-3. **广播 `on_llm_request` 给其它所有已加载插件**（人格/记忆插件有机会注入 `system_prompt` 与上下文）
-4. 调用 `context.llm_generate(chat_provider_id=..., ...)`，超时由 `llm_timeout` 控制
+3. **广播 `on_llm_request` 给其它所有已加载插件**（人格/记忆插件有机会注入 `system_prompt` 与上下文 `contexts`）
+4. 把注入后的 `system_prompt`、`contexts` 连同 `prompt` 一起调用 `context.llm_generate(chat_provider_id=..., ...)`，超时由 `llm_timeout` 控制
 5. AI 空回复/超时/异常 → 记该目标失败（`ok:false`），**不降级为发送原文**
 
 **独立 AI（standalone）调用流程**：不广播 `on_llm_request`，直接用**该任务的 `system_prompt`**（空则用默认提示）+ 任务提示词调用 `context.llm_generate`；`chat_provider_id` 从第一个目标 UMO 的会话配置获取。所有目标共享同一次生成结果（不依赖会话人格）。
@@ -230,6 +231,51 @@ default:GroupMessage:xxxxxx
 
 ---
 
+## LLM 调用日志（独立文件）
+
+当任务内容使用「独立 AI」或「对话 AI」模式时，每次真正调用 AI 都会往独立文件 `data_dir/llm_calls.jsonl` 追加一条记录（**append-only**，JSONL，一行一条），成功与失败都记。每条包含：
+
+- **完整请求体**：`request.system_prompt`（最终系统提示，含 `on_llm_request` 广播注入的人格/记忆）、`request.contexts`（注入的上下文消息历史）、`request.prompt`（最终用户提示词）、`provider_id`、`model`
+- **AI 回复**：`response.role`、`response.completion_text`（正文）、`response.reasoning_content`（推理内容，若有）、`response.usage`（input/output/total tokens）
+- 元信息：`time`、`task_id`、`task_name`、`source`（定时/手动）、`mode`（standalone/conversation）、`umo`、`ok`、`duration_ms`、`error`
+
+示例（对话模式，含人格与记忆注入后的最终请求）：
+
+```json
+{
+  "time": "2026-09-04 22:35:00",
+  "task_id": "uuid",
+  "task_name": "随机问候",
+  "source": "scheduled",
+  "mode": "conversation",
+  "umo": "default:FriendMessage:xxxx",
+  "ok": true,
+  "duration_ms": 2314,
+  "request": {
+    "provider_id": "openai",
+    "model": "gpt-4o-mini",
+    "system_prompt": "你是助手，一个……（人格注入）……\n[记忆] 用户最近……",
+    "contexts": [{"role":"user","content":"……"}],
+    "prompt": "现在时间是2026-09-04 22:35:00，你被一个随机触发规则唤醒……"
+  },
+  "response": {
+    "role": "assistant",
+    "completion_text": "嗨，这么晚还没睡吗……",
+    "reasoning_content": "",
+    "usage": {"input": 512, "output": 34, "total": 546}
+  },
+  "error": null
+}
+```
+
+说明：
+
+- 记录的是**广播注入后、真正交给 `context.llm_generate` 的最终请求体**——`conversation` 模式在调用前会广播 `on_llm_request`，故 `system_prompt`/`contexts` 已包含人格、记忆等插件注入；`standalone` 模式不广播，`system_prompt` 为该任务自己的提示。
+- 请求体可能很大（记忆/上下文），故保留条数由 `llm_log_retention` 控制（超限自动裁剪，保留最近 N 条）。
+- WebUI 新增「LLM 调用日志」标签页：可展开查看每条记录的完整请求体与回复，支持刷新、清空、分页加载更多。
+
+---
+
 ## 文件结构
 
 ```
@@ -245,7 +291,10 @@ astrbot_plugin_enhanced_scheduler/
     └── style.css              # 亮/暗主题适配
 ```
 
-持久化数据写在 `data/plugins/astrbot_plugin_enhanced_scheduler/tasks.json`（AstrBot 推荐的 `StarTools.get_data_dir` 路径），不在插件自身目录里——升级/重装不会丢配置。
+持久化数据写在 `data/plugins/astrbot_plugin_enhanced_scheduler/` 下（AstrBot 推荐的 `StarTools.get_data_dir` 路径），不在插件自身目录里——升级/重装不会丢配置：
+
+- `tasks.json`：任务与内存日志
+- `llm_calls.jsonl`：LLM 调用日志（完整请求体 + 回复，append-only）
 
 ## Web API
 
@@ -262,6 +311,8 @@ astrbot_plugin_enhanced_scheduler/
 | `/validate` | POST | 校验触发器组与逻辑规则，返回下次触发预览 |
 | `/preview_next` | POST | 给定触发器列表，返回下次触发时间 |
 | `/trigger_now` | POST | 立即手动触发一次任务（忽略触发规则与启用状态，仅执行内容并发送） |
+| `/get_llm_logs` | GET | 分页读取 `llm_calls.jsonl`（`limit`/`offset`，最新在前） |
+| `/clear_llm_logs` | POST | 清空 `llm_calls.jsonl` |
 
 ## 已知限制
 

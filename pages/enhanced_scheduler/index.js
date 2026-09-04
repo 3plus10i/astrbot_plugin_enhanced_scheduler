@@ -8,6 +8,10 @@ async function init() {
     let sessionsList = [];
     let validateTimer = null;
     let defaultPrompt = "";
+    let allLlmLogs = [];
+    let llmLogOffset = 0;
+    let llmLogTotal = 0;
+    const LLM_PAGE = 50;
 
     // ── 工具函数 ──
     function $(id) { return document.getElementById(id); }
@@ -63,6 +67,7 @@ async function init() {
             document.querySelectorAll(".tab-view").forEach(v => v.classList.remove("active"));
             btn.classList.add("active");
             $("view-" + btn.getAttribute("data-tab")).classList.add("active");
+            if (btn.getAttribute("data-tab") === "llm" && !allLlmLogs.length) loadLlmLogs(true);
         });
     });
 
@@ -162,7 +167,111 @@ async function init() {
         $("config-poll-interval").value = cfg.poll_interval != null ? cfg.poll_interval : 60;
         $("config-log-retention").value = cfg.log_retention != null ? cfg.log_retention : 200;
         $("config-llm-timeout").value = cfg.llm_timeout != null ? cfg.llm_timeout : 60;
+        $("config-llm-log-retention").value = cfg.llm_log_retention != null ? cfg.llm_log_retention : 500;
     }
+
+    // ── LLM 调用日志 ──
+    function ctxToText(ctx) {
+        if (ctx == null) return "";
+        const content = ctx.content;
+        if (typeof content === "string") return content;
+        if (Array.isArray(content)) {
+            return content.map(p => {
+                if (typeof p === "string") return p;
+                if (p && typeof p === "object") {
+                    if (p.type === "text") return p.text || "";
+                    if (p.type === "image_url") return "[图片]";
+                    if (p.type === "audio_url") return "[音频]";
+                    return JSON.stringify(p);
+                }
+                return String(p);
+            }).join("\n");
+        }
+        if (typeof content === "object" && content !== null) return JSON.stringify(content);
+        return String(content ?? "");
+    }
+
+    function renderLlmLogs() {
+        const list = $("llm-logs-list");
+        if (!allLlmLogs.length) {
+            list.innerHTML = `<div class="empty-hint">暂无 LLM 调用记录。任务使用「独立 AI / 对话 AI」模式触发后会显示在此。</div>`;
+            $("llm-logs-more").style.display = "none";
+            return;
+        }
+        list.innerHTML = allLlmLogs.map((e, i) => {
+            const modeCN = e.mode === "standalone" ? "独立AI" : "对话AI";
+            const okBadge = e.ok ? '<span class="badge badge-active">成功</span>' : '<span class="badge badge-failed">失败</span>';
+            const srcBadge = e.source === "manual" ? '<span class="badge badge-llm">手动</span>' : '<span class="badge badge-inactive">定时</span>';
+            const req = e.request || {};
+            const resp = e.response || {};
+            const usage = (resp.usage && resp.usage.input != null) ? `<span class="llm-meta">tokens 入${resp.usage.input}/出${resp.usage.output}</span>` : "";
+            const contexts = Array.isArray(req.contexts) ? req.contexts : [];
+            const ctxHtml = contexts.map(c => {
+                const role = (c && c.role) ? c.role : "?";
+                return `<div class="llm-ctx"><span class="llm-ctx-role">${escapeHtml(role)}</span><pre>${escapeHtml(ctxToText(c))}</pre></div>`;
+            }).join("");
+            const reasonHtml = resp.reasoning_content
+                ? `<div class="llm-sub-label">推理内容（reasoning）</div><pre class="llm-pre">${escapeHtml(String(resp.reasoning_content))}</pre>` : "";
+            const errHtml = e.error
+                ? `<div class="llm-sub-label" style="color:var(--color-danger);">错误</div><pre class="llm-pre">${escapeHtml(String(e.error))}</pre>` : "";
+            return `<div class="llm-log-item">
+                <div class="llm-log-item-head" data-llm-idx="${i}">
+                    ${okBadge} ${srcBadge}
+                    <span class="badge badge-llm">${modeCN}</span>
+                    <span class="llm-task">${escapeHtml(e.task_name || "")}</span>
+                    <span class="llm-meta">${escapeHtml(maskUmo(e.umo || ""))}</span>
+                    <span class="llm-meta">${e.duration_ms != null ? e.duration_ms + "ms" : ""}</span>
+                    ${usage}
+                    <span class="llm-time">${escapeHtml(e.time || "")}</span>
+                    <span class="llm-expand-arrow">▾</span>
+                </div>
+                <div class="llm-log-item-body" style="display:none;">
+                    <div class="llm-sub-label">Provider / 模型</div>
+                    <div class="llm-meta">${escapeHtml(req.provider_id || "—")}${req.model ? " · " + escapeHtml(req.model) : ""}</div>
+                    <div class="llm-sub-label">系统提示（system_prompt）</div>
+                    <pre class="llm-pre">${escapeHtml(req.system_prompt || "")}</pre>
+                    <div class="llm-sub-label">上下文（contexts，${contexts.length} 条）</div>
+                    ${ctxHtml || '<div class="llm-meta">（无）</div>'}
+                    <div class="llm-sub-label">用户提示（prompt）</div>
+                    <pre class="llm-pre">${escapeHtml(req.prompt || "")}</pre>
+                    <div class="llm-sub-label">AI 回复（completion_text）</div>
+                    <pre class="llm-pre">${escapeHtml(resp.completion_text || "")}</pre>
+                    ${reasonHtml}
+                    ${errHtml}
+                </div>
+            </div>`;
+        }).join("");
+        $("llm-logs-more").style.display = (allLlmLogs.length < llmLogTotal) ? "block" : "none";
+        list.querySelectorAll(".llm-log-item-head").forEach(head => {
+            head.addEventListener("click", () => {
+                const body = head.nextElementSibling;
+                const arrow = head.querySelector(".llm-expand-arrow");
+                const isHidden = body.style.display === "none";
+                body.style.display = isHidden ? "block" : "none";
+                if (arrow) arrow.textContent = isHidden ? "▴" : "▾";
+            });
+        });
+    }
+
+    async function loadLlmLogs(reset) {
+        if (reset) { allLlmLogs = []; llmLogOffset = 0; llmLogTotal = 0; }
+        try {
+            const res = await bridge.apiGet("get_llm_logs", { limit: LLM_PAGE, offset: llmLogOffset });
+            if (!res || res.status !== "success") { showToast("获取 LLM 日志失败", true); return; }
+            llmLogTotal = res.total || 0;
+            const entries = res.entries || [];
+            allLlmLogs = reset ? entries : allLlmLogs.concat(entries);
+            llmLogOffset = llmLogOffset + entries.length;
+            renderLlmLogs();
+        } catch (e) { showToast("加载 LLM 日志失败: " + e.message, true); }
+    }
+    $("refresh-llm-btn").addEventListener("click", () => loadLlmLogs(true));
+    $("llm-load-more-btn").addEventListener("click", () => loadLlmLogs(false));
+    $("clear-llm-btn").addEventListener("click", () => {
+        confirmMode = "clear-llm";
+        $("confirm-modal-text").textContent = "确定要清空所有 LLM 调用日志吗？此操作不可撤销。";
+        confirmModal.classList.add("active");
+    });
 
     function attachTaskRowListeners() {
         document.querySelectorAll(".edit-task-btn").forEach(b => b.addEventListener("click", () => openTaskModal("edit", b.getAttribute("data-id"))));
@@ -624,24 +733,33 @@ async function init() {
     }
 
     let pendingDeleteId = null;
+    let confirmMode = "delete";
     const confirmModal = $("confirm-modal-overlay");
     function confirmDelete(id) {
+        confirmMode = "delete";
         pendingDeleteId = id;
         const t = allTasks[id];
         $("confirm-modal-text").textContent = `确定要删除任务「${t ? t.name : id}」吗？`;
         confirmModal.classList.add("active");
     }
-    $("confirm-modal-cancel-btn").addEventListener("click", () => { confirmModal.classList.remove("active"); pendingDeleteId = null; });
-    confirmModal.addEventListener("click", e => { if (e.target === confirmModal) { confirmModal.classList.remove("active"); pendingDeleteId = null; } });
+    function closeConfirm() { confirmModal.classList.remove("active"); pendingDeleteId = null; confirmMode = "delete"; }
+    $("confirm-modal-cancel-btn").addEventListener("click", closeConfirm);
+    confirmModal.addEventListener("click", e => { if (e.target === confirmModal) closeConfirm(); });
     $("confirm-modal-ok-btn").addEventListener("click", async () => {
-        if (!pendingDeleteId) return;
         const okBtn = $("confirm-modal-ok-btn");
-        okBtn.disabled = true; okBtn.textContent = "删除中...";
+        okBtn.disabled = true; okBtn.textContent = "处理中...";
         try {
-            const res = await bridge.apiPost("delete_task", { id: pendingDeleteId });
-            if (res && res.status === "success") { showToast("已删除"); confirmModal.classList.remove("active"); pendingDeleteId = null; await loadData(); }
-            else showToast("删除失败: " + (res && res.message || ""), true);
-        } catch (e) { showToast("删除失败: " + e.message, true); }
+            if (confirmMode === "clear-llm") {
+                const res = await bridge.apiPost("clear_llm_logs", {});
+                if (res && res.status === "success") { showToast("LLM 日志已清空"); closeConfirm(); await loadLlmLogs(true); }
+                else showToast("清空失败: " + (res && res.message || ""), true);
+            } else {
+                if (!pendingDeleteId) { okBtn.disabled = false; okBtn.textContent = "确定"; return; }
+                const res = await bridge.apiPost("delete_task", { id: pendingDeleteId });
+                if (res && res.status === "success") { showToast("已删除"); closeConfirm(); await loadData(); }
+                else showToast("删除失败: " + (res && res.message || ""), true);
+            }
+        } catch (e) { showToast("操作失败: " + e.message, true); }
         finally { okBtn.disabled = false; okBtn.textContent = "确定"; }
     });
 
@@ -652,6 +770,7 @@ async function init() {
             poll_interval: parseInt($("config-poll-interval").value) || 60,
             log_retention: parseInt($("config-log-retention").value) || 200,
             llm_timeout: parseInt($("config-llm-timeout").value) || 60,
+            llm_log_retention: parseInt($("config-llm-log-retention").value) || 500,
         };
         const btn = $("save-config-btn");
         btn.disabled = true; btn.textContent = "保存中...";
@@ -668,7 +787,10 @@ async function init() {
     // ── 初始化 ──
     await loadSessions();
     await loadData();
-    setInterval(() => { if ($("view-logs").classList.contains("active")) loadData(); }, 8000);
+    setInterval(() => {
+        if ($("view-logs").classList.contains("active")) loadData();
+        if ($("view-llm").classList.contains("active")) loadLlmLogs(true);
+    }, 8000);
 }
 
 if (document.readyState === "complete" || document.readyState === "interactive") init();

@@ -19,5 +19,12 @@
     "hint": "任务内容标记为需要 AI 处理时，单次生成的最大等待时长。超时则记为失败。默认 60 秒。",
     "obvious_hint": true,
     "default": 60
+  },
+  "llm_log_retention": {
+    "type": "int",
+    "description": "LLM 调用日志保留条数",
+    "hint": "独立日志文件 llm_calls.jsonl 中保留最近多少条 AI 请求/回复记录（含完整请求体）。默认 500 条。",
+    "obvious_hint": true,
+    "default": 500
   }
 }
