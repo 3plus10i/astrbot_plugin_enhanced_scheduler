@@ -127,7 +127,7 @@
                             </div>
                             <div class="form-group">
                                 <label class="form-label">LLM 调用日志保留条数</label>
-                                <input type="number" class="form-input" id="config-llm-log-retention" min="50" max="10000" required>
+                                <input type="number" class="form-input" id="config-llm-log-retention" min="10" max="10000" required>
                                 <span class="form-hint">独立文件 llm_calls.jsonl 中保留最近多少条 AI 请求/回复记录（含完整请求体）。</span>
                             </div>
                             <div style="display:flex;justify-content:flex-end;margin-top:16px;">
@@ -174,7 +174,7 @@
                         </div>
                         <div id="triggers-list"></div>
                         <div class="triggers-add-row">
-                            <button class="btn btn-primary btn-sm" id="add-trigger-btn" type="button"><span>+ 增加触发器</span></button>
+                            <button class="btn btn-sm" id="add-trigger-btn" type="button"><span>+ 增加触发器</span></button>
                         </div>
                     </div>
 

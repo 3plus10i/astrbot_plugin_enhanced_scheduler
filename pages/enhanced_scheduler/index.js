@@ -163,7 +163,7 @@ async function init() {
         $("config-poll-interval").value = cfg.poll_interval != null ? cfg.poll_interval : 60;
         $("config-log-retention").value = cfg.log_retention != null ? cfg.log_retention : 200;
         $("config-llm-timeout").value = cfg.llm_timeout != null ? cfg.llm_timeout : 60;
-        $("config-llm-log-retention").value = cfg.llm_log_retention != null ? cfg.llm_log_retention : 500;
+        $("config-llm-log-retention").value = cfg.llm_log_retention != null ? cfg.llm_log_retention : 10;
     }
 
     // ── LLM 调用日志（原始文件内容，不渲染） ──
@@ -239,10 +239,10 @@ async function init() {
 
     // ── 触发器组管理 ──
     const TYPE_LABELS = {
-        interval: { label: "主动-周期型", desc: "从基准时间起，按固定周期（天/小时/分钟）累加触发；基准时间默认=创建当天 0:00；主动到点。" },
+        interval: { label: "主动-周期型", desc: "从基准时间起，按固定周期累加触发；主动到点。" },
         cron: { label: "主动-cron型", desc: "按标准 5 段 cron 表达式（分 时 日 月 周）触发；主动到点。" },
-        window: { label: "被动-区间型", desc: "每天指定时间段内（可限星期几）为真；仅被逻辑规则引用时实时求值。" },
-        random: { label: "被动-随机型", desc: "按阈值随机为真（U(0,1) < 阈值）；仅被逻辑规则引用时采样一次。" },
+        window: { label: "被动-区间型", desc: "每天指定时间段内为真；仅被逻辑规则引用时实时求值。" },
+        random: { label: "被动-随机型", desc: "以给定概率为真；仅被逻辑规则引用时采样一次。" },
         cooldown: { label: "被动-冷却型", desc: "距上次成功发送超过冷却时长为真；仅被逻辑规则引用时实时求值。" },
     };
 
@@ -323,7 +323,7 @@ async function init() {
                 </div>
             `;
         } else if (type === "random") {
-            html = `<div><label class="form-hint">阈值 (0-1)</label><input type="number" class="form-input field-threshold" min="0" max="1" step="0.01" value="${cfg.threshold!=null?cfg.threshold:0.5}"></div>`;
+            html = `<div><label class="form-hint">概率值 (0-1)</label><input type="number" class="form-input field-threshold" min="0" max="1" step="0.01" value="${cfg.threshold!=null?cfg.threshold:0.5}"></div>`;
         } else if (type === "cooldown") {
             html = `
                 <div><label class="form-hint">小时</label><input type="number" class="form-input field-hours" min="0" value="${cfg.hours||0}"></div>
@@ -571,11 +571,12 @@ async function init() {
             if (!el) return;
             const type = card.querySelector(".trigger-type-select").value;
             if (type === "interval" || type === "cron") {
-                if (tr.next_fire) {
-                    el.textContent = "下次触发: " + fmtTs(tr.next_fire);
+                const fires = tr.future_fires || [];
+                if (fires.length) {
+                    el.textContent = "未来触发: " + fires.map(f => fmtTs(f)).join("，");
                     el.className = "trigger-next-fire active";
                 } else {
-                    el.textContent = "无法计算下次触发（请检查配置）";
+                    el.textContent = "无法计算未来触发（请检查配置）";
                     el.className = "trigger-next-fire";
                 }
             } else {

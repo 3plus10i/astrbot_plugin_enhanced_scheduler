@@ -123,8 +123,8 @@ html[data-theme="dark"] .section-block { background: rgba(255,255,255,0.02); }
 .section-block-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
 
 /* 触发器卡片 */
-.triggers-add-row { margin-top: 4px; }
-.triggers-add-row .btn { width: 75%; margin: 0 12.5%; }
+.triggers-add-row { margin-top: 30px; }
+.triggers-add-row .btn { width: 50%; margin: 0 0 0 50%; border: 1px dashed var(--color-primary); background: none; color: var(--color-primary);}
 .trigger-card { border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 14px; margin-bottom: 10px; background: var(--bg-card); }
 .trigger-card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
 .trigger-id-badge { background: var(--color-primary); color: #fff; font-weight: 700; font-size: 13px; width: 28px; height: 28px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }

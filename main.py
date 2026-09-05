@@ -140,10 +140,10 @@ class EnhancedSchedulerPlugin(Star):
 
     def _llm_log_retention(self) -> int:
         try:
-            v = int(self.config.get("llm_log_retention", 500))
-            return max(50, v)
+            v = int(self.config.get("llm_log_retention", 10))
+            return max(10, v)
         except (TypeError, ValueError):
-            return 500
+            return 10
 
     def _standalone_prompt(self, content: dict) -> str:
         """解析独立 AI 模式的 system prompt（任务级，空则回退默认）。"""
@@ -787,7 +787,8 @@ class EnhancedSchedulerPlugin(Star):
             with open(self.llm_log_file, "r", encoding="utf-8") as f:
                 lines = f.read().splitlines()
             lines.reverse()
-            return "\n".join(lines)
+            # 每条记录之间空一行，便于肉眼区分
+            return "\n\n".join(lines)
         except Exception as e:
             logger.error(f"[EnhancedScheduler] 读取 LLM 原始日志失败: {e}")
             return ""
@@ -1126,12 +1127,12 @@ class EnhancedSchedulerPlugin(Star):
             valid_ids = []
             for tg in triggers:
                 ok, msg = core.validate_trigger(tg)
-                entry = {"id": tg.get("id"), "ok": ok, "msg": msg, "next_fire": None}
+                entry = {"id": tg.get("id"), "ok": ok, "msg": msg, "future_fires": None}
                 if ok:
                     valid_ids.append(tg.get("id"))
                     if tg.get("type") in core.ACTIVE_TYPES:
-                        # 以当前时刻为起点预览该触发器的下一个触发点（与 last_fired 无关）
-                        entry["next_fire"] = core._next_fire_strictly_after(tg, now)
+                        # 以当前时刻为起点预览该触发器的未来 3 个触发点（与 last_fired 无关）
+                        entry["future_fires"] = core.future_fires(tg, now, 3)
                 results["triggers"].append(entry)
 
             logic_expr = str(req.get("logic_expr", "") or "")
@@ -1141,18 +1142,8 @@ class EnhancedSchedulerPlugin(Star):
             else:
                 results["logic"] = {"ok": False, "msg": "逻辑规则为空"}
 
-            # 下次触发预览（仅主动触发器）
-            norm_triggers = []
-            for tg in triggers:
-                if core.validate_trigger(tg)[0]:
-                    norm_triggers.append({
-                        "id": tg.get("id"),
-                        "type": tg.get("type"),
-                        "config": tg.get("config", {}),
-                        "last_fired": float(tg.get("last_fired", 0.0) or 0.0),
-                    })
-            nf = core.next_trigger_preview(norm_triggers, now)
-            results["next_fire"] = nf
+            # 下次检查触发时间（触发器组级别，仅主动触发器）
+            results["next_fire"] = core.next_trigger_preview(triggers, now)
             results["now"] = now
             return jsonify({"status": "success", "results": results})
         except Exception as e:

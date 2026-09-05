@@ -358,6 +358,25 @@ def has_pending_fire(tasks: Dict[str, Any], now_ts: float) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 未来触发时刻预览
+# 只有主动型触发器（interval / cron）能预测未来触发时刻；逐个复用
+# _next_fire_strictly_after 推进，避免与调度主循环的计算逻辑漂移。
+# ─────────────────────────────────────────────────────────────────────
+
+def future_fires(trigger: Dict[str, Any], now_ts: float, count: int = 3) -> List[float]:
+    """返回主动触发器未来 count 个触发点时间戳（严格大于 now_ts）；被动型或无可行点返回空列表。"""
+    fires: List[float] = []
+    cursor = now_ts
+    for _ in range(count):
+        nf = _next_fire_strictly_after(trigger, cursor)
+        if nf is None:
+            break
+        fires.append(nf)
+        cursor = nf
+    return fires
+
+
+# ─────────────────────────────────────────────────────────────────────
 # 被动触发器：实时真值
 # ─────────────────────────────────────────────────────────────────────
 

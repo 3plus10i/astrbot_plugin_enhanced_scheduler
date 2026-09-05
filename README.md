@@ -32,7 +32,7 @@ WebUI → 插件管理 → 找到「增强计划任务」→ 进入 Pages 页面
 | `poll_interval` | int | 60 | 兜底轮询间隔（秒）。仅在无主动触发器或调度计算失败时生效；正常时按最近触发点自适应唤醒，不受此值影响 |
 | `log_retention` | int | 200 | 内存中保留最近多少条触发/执行日志。最小 10 |
 | `llm_timeout` | int | 60 | AI 单次生成超时（秒）。最小 5 |
-| `llm_log_retention` | int | 500 | 独立文件 `llm_calls.jsonl` 保留最近多少条 AI 调用记录（含完整请求体）。最小 50 |
+| `llm_log_retention` | int | 10 | 独立文件 `llm_calls.jsonl` 保留最近多少条 AI 调用记录（含完整请求体）。最小 10 |
 
 ---
 
