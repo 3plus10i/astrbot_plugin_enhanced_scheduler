@@ -1,11 +1,6 @@
 """
-main.py — 增强计划任务插件（astrbot_plugin_enhanced_scheduler）
-
-未来计划任务调度器。支持周期/cron/区间/随机/冷却五种触发器，通过逻辑表达式组合触发器组，可为同一事件绑定多个计时器。任务内容可为固定文本、AI 提示词或空动作。
 核心调度逻辑见 scheduler_core.py；本文件负责 AstrBot 集成：持久化、轮询、执行、Web API。
 
-适用平台：OneBot v11（aiocqhttp / napcat）
-适用版本：AstrBot >= 4.27.0
 """
 
 import os
