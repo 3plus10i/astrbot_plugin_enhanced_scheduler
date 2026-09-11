@@ -46,7 +46,7 @@ DEFAULT_STANDALONE_SYSTEM_PROMPT = "<proactive_trigger>这是由计划任务自�
     PLUGIN_NAME,
     "3plus10i",
     "未来任务调度器，支持多触发器组合与逻辑规则。",
-    "1.0.0",
+    "1.1.0",
 )
 class EnhancedSchedulerPlugin(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):

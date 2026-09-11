@@ -63,7 +63,7 @@ async function init() {
             document.querySelectorAll(".tab-view").forEach(v => v.classList.remove("active"));
             btn.classList.add("active");
             $("view-" + btn.getAttribute("data-tab")).classList.add("active");
-            if (btn.getAttribute("data-tab") === "llm" && !llmLoaded) loadLlmRaw();
+            if (btn.getAttribute("data-tab") === "llm" && !llmLoaded) loadLlmLogs();
         });
     });
 
@@ -166,18 +166,155 @@ async function init() {
         $("config-llm-log-retention").value = cfg.llm_log_retention != null ? cfg.llm_log_retention : 10;
     }
 
-    // ── LLM 调用日志（原始文件内容，不渲染） ──
+    // ── LLM 调用日志（按条折叠卡片） ──
     let llmLoaded = false;
-    async function loadLlmRaw() {
-        try {
-            const res = await bridge.apiGet("get_llm_logs_raw", {});
-            if (!res || res.status !== "success") { showToast("获取 LLM 日志失败", true); return; }
-            const content = res.content || "";
-            $("llm-raw-content").textContent = content ? content : "暂无记录。";
-            llmLoaded = true;
-        } catch (e) { showToast("加载 LLM 日志失败: " + e.message, true); }
+    const LLM_PREVIEW_LEN = 200;
+    const B64_RE = /data:image\/[\w.+-]+;base64,[A-Za-z0-9+/=_-]+/g;
+
+    function showLlmLoading() {
+        $("llm-log-list").innerHTML = `<div class="llm-loading"><span class="spinner"></span>正在加载…</div>`;
     }
-    $("refresh-llm-btn").addEventListener("click", loadLlmRaw);
+    async function loadLlmLogs() {
+        showLlmLoading();
+        try {
+            const res = await bridge.apiGet("get_llm_logs", { limit: 200 });
+            if (!res || res.status !== "success") { showToast("获取 LLM 日志失败", true); return; }
+            renderLlmLogs(res.entries || []);
+            llmLoaded = true;
+        } catch (e) {
+            $("llm-log-list").innerHTML = `<div class="empty-hint">加载失败：${escapeHtml(e.message)}</div>`;
+            showToast("加载 LLM 日志失败: " + e.message, true);
+        }
+    }
+    // 把文本里的 base64 图片 data URL 折叠成 chip，返回 HTML 与原始 base64 列表
+    function foldBase64(text) {
+        const b64List = [];
+        let html = "", last = 0, m;
+        B64_RE.lastIndex = 0;
+        while ((m = B64_RE.exec(text)) !== null) {
+            html += escapeHtml(text.slice(last, m.index));
+            const idx = b64List.length;
+            b64List.push(m[0]);
+            html += `<span class="b64-chip" data-idx="${idx}" title="点击复制 base64 内容">base64图片</span>`;
+            last = B64_RE.lastIndex;
+        }
+        html += escapeHtml(text.slice(last));
+        return { html, b64List };
+    }
+    // 按 formatted 渲染某条卡片内容；默认 false = 原始格式
+    function renderLlmContent(card, formatted) {
+        const text = formatted ? JSON.stringify(card._entry, null, 2) : JSON.stringify(card._entry);
+        const { html, b64List } = foldBase64(text);
+        card._b64List = b64List;
+        card._formatted = formatted;
+        card.querySelector(".llm-log-full").innerHTML = html;
+        const btn = card.querySelector(".llm-format-toggle");
+        if (btn) btn.textContent = formatted ? "原始格式" : "将JSON格式化";
+    }
+    function renderLlmLogs(entries) {
+        const list = $("llm-log-list");
+        if (!entries.length) {
+            list.innerHTML = `<div class="empty-hint">暂无记录。</div>`;
+            return;
+        }
+        list.innerHTML = entries.map(e => {
+            const preview = JSON.stringify(e).slice(0, LLM_PREVIEW_LEN);
+            return `
+                <details class="llm-log-card">
+                    <summary class="llm-log-summary">
+                        <span class="llm-log-time">${escapeHtml(e.time || "")}</span>
+                        <span class="llm-log-preview">${escapeHtml(preview)}</span>
+                    </summary>
+                    <div class="llm-log-body">
+                        <div class="llm-log-toolbar">
+                            <button type="button" class="btn btn-secondary btn-sm llm-format-toggle">格式化</button>
+                        </div>
+                        <pre class="llm-log-full"></pre>
+                    </div>
+                </details>`;
+        }).join("");
+        Array.from(list.querySelectorAll(".llm-log-card")).forEach((card, i) => {
+            card._entry = entries[i];
+            renderLlmContent(card, false);
+        });
+    }
+    async function copyToClipboard(text) {
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(text);
+                return true;
+            }
+        } catch (e) { /* 落回下面 execCommand */ }
+        try {
+            const ta = document.createElement("textarea");
+            ta.value = text;
+            ta.style.position = "fixed";
+            ta.style.opacity = "0";
+            document.body.appendChild(ta);
+            ta.select();
+            const ok = document.execCommand("copy");
+            document.body.removeChild(ta);
+            return ok;
+        } catch (e) { return false; }
+    }
+    // 直接把 base64 data URL 渲染为图片（正则已限定字符集，无 XSS 风险）
+    function showB64Popover(anchor, dataUrl) {
+        const pop = $("b64-popover");
+        pop._dataUrl = dataUrl;
+        pop.innerHTML = `
+            <img class="b64-img" src="${dataUrl}" alt="base64 图片" title="右键可保存图片">
+            <div class="b64-actions">
+                <button type="button" class="btn btn-secondary btn-sm b64-copy-btn">复制 Base64</button>
+            </div>`;
+        const img = pop.querySelector(".b64-img");
+        if (img) img.addEventListener("error", () => {
+            const err = document.createElement("div");
+            err.className = "b64-img-error";
+            err.textContent = "无法解析该 Base64 图片";
+            img.replaceWith(err);
+        });
+        // 定位：触发元素偏下时显示在其上方，避免超出视口
+        const r = anchor.getBoundingClientRect();
+        pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 372)) + "px";
+        if (r.bottom > window.innerHeight * 0.6) {
+            pop.style.top = "auto";
+            pop.style.bottom = (window.innerHeight - r.top + 6) + "px";
+        } else {
+            pop.style.bottom = "auto";
+            pop.style.top = (r.bottom + 6) + "px";
+        }
+        pop.classList.add("show");
+    }
+    $("llm-log-list").addEventListener("click", ev => {
+        const chip = ev.target.closest(".b64-chip");
+        if (chip) {
+            const card = chip.closest(".llm-log-card");
+            const idx = parseInt(chip.getAttribute("data-idx"), 10);
+            const dataUrl = (card && card._b64List && card._b64List[idx]) || "";
+            if (dataUrl) showB64Popover(chip, dataUrl);
+            else showToast("未找到图片内容", true);
+            return;
+        }
+        const btn = ev.target.closest(".llm-format-toggle");
+        if (btn) {
+            const card = btn.closest(".llm-log-card");
+            if (card) renderLlmContent(card, !card._formatted);
+        }
+    });
+    document.addEventListener("click", async ev => {
+        const copyBtn = ev.target.closest(".b64-copy-btn");
+        if (copyBtn) {
+            const pop = $("b64-popover");
+            const dataUrl = pop && pop._dataUrl;
+            if (dataUrl && await copyToClipboard(dataUrl)) showToast("Base64 图片内容已复制");
+            else showToast("复制失败，请手动选择复制", true);
+            return;
+        }
+        if (ev.target.closest(".b64-chip") || ev.target.closest("#b64-popover")) return;
+        const pop = $("b64-popover");
+        if (pop) pop.classList.remove("show");
+    });
+    $("refresh-llm-btn").addEventListener("click", loadLlmLogs);
     $("clear-llm-btn").addEventListener("click", () => {
         confirmMode = "clear-llm";
         $("confirm-modal-text").textContent = "确定要清空所有 LLM 调用日志吗？此操作不可撤销。";
@@ -663,7 +800,7 @@ async function init() {
         try {
             if (confirmMode === "clear-llm") {
                 const res = await bridge.apiPost("clear_llm_logs", {});
-                if (res && res.status === "success") { showToast("LLM 日志已清空"); closeConfirm(); llmLoaded = false; await loadLlmRaw(); }
+                if (res && res.status === "success") { showToast("LLM 日志已清空"); closeConfirm(); llmLoaded = false; await loadLlmLogs(); }
                 else showToast("清空失败: " + (res && res.message || ""), true);
             } else {
                 if (!pendingDeleteId) { okBtn.disabled = false; okBtn.textContent = "确定"; return; }

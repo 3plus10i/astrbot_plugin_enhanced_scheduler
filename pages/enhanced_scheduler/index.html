@@ -12,7 +12,7 @@
             <div class="header-left">
                 <span class="back-btn" id="back-btn">← 返回</span>
                 <h1 class="page-title">增强计划任务</h1>
-                <span class="plugin-version">v1.0.0</span>
+                <span class="plugin-version">v1.1.0</span>
             </div>
             <div class="header-right">
                 <div class="tab-nav">
@@ -91,7 +91,7 @@
                     <div class="card-header">
                         <div class="card-header-title-group">
                             <h2 class="card-title">LLM 调用日志</h2>
-                            <span class="form-hint" style="font-weight:400;">原始文件内容（llm_calls.jsonl），仅供 debug 查看</span>
+                            <span class="form-hint" style="font-weight:400;">按条折叠展示，点击展开查看完整请求与回复</span>
                         </div>
                         <div style="display:flex;gap:8px;">
                             <button class="btn btn-secondary" id="refresh-llm-btn"><span>刷新</span></button>
@@ -99,7 +99,7 @@
                         </div>
                     </div>
                     <div class="card-body">
-                        <pre class="llm-raw" id="llm-raw-content">暂无记录。</pre>
+                        <div class="llm-log-list" id="llm-log-list"><div class="empty-hint">暂无记录。</div></div>
                     </div>
                 </div>
             </section>
@@ -247,6 +247,8 @@
     </div>
 
     <div class="toast" id="toast">操作成功</div>
+
+    <div class="b64-popover" id="b64-popover"></div>
 
     <script src="index.js"></script>
 </body>

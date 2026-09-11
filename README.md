@@ -329,4 +329,4 @@ astrbot_plugin_enhanced_scheduler/
 
 ## 版本
 
-- `1.0.0`
+- `1.1.0`
