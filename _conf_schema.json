@@ -23,7 +23,7 @@
   "llm_log_retention": {
     "type": "int",
     "description": "LLM 调用日志保留条数",
-    "hint": "独立日志文件 llm_calls.jsonl 中保留最近多少条 AI 请求/回复记录（含完整请求体）。默认 10 条。",
+    "hint": "日志目录中保留最近多少条 AI 请求/回复记录（一条记录一个文件，含完整请求体与图片）。默认 10 条。",
     "obvious_hint": true,
     "default": 10
   }

@@ -105,9 +105,6 @@ body {
 .form-input { width: 100%; padding: 11px 16px; font-size: 14px; background: var(--bg-app); border: 1px solid var(--border-color); border-radius: var(--radius-md); color: var(--text-primary); transition: var(--transition-base); outline: none; font-family: inherit; }
 .form-input:focus { border-color: var(--color-primary); box-shadow: 0 0 0 3px rgba(99,102,241,0.15); background: var(--bg-card); }
 textarea.form-input { resize: vertical; min-height: 80px; }
-.form-inline-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.form-inline-row .form-input { flex: 1; min-width: 80px; }
-.field-suffix { font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
 
 /* 开关 */
 .switch-toggle { position: relative; display: inline-block; width: 48px; height: 26px; flex-shrink: 0; }
@@ -131,8 +128,6 @@ html[data-theme="dark"] .section-block { background: rgba(255,255,255,0.02); }
 .trigger-type-select { flex: 1; min-width: 140px; padding: 8px 12px; font-size: 13px; background: var(--bg-app); border: 1px solid var(--border-color); border-radius: var(--radius-md); color: var(--text-primary); outline: none; }
 .trigger-config-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 10px; }
 .trigger-config-fields .full-row { grid-column: 1 / -1; }
-.trigger-type-fields { display: none; }
-.trigger-type-fields.active { display: block; }
 
 /* 星期复选框 */
 .weekdays-group { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -182,9 +177,6 @@ textarea.form-input.disabled, textarea.form-input:disabled { opacity: .55; curso
 .toast.show { transform: translateY(0); opacity: 1; visibility: visible; }
 .toast.error { background: var(--color-danger); color: #fff; }
 
-/* LLM 调用日志查看器（原始文件内容） */
-.llm-raw { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.55; background: var(--bg-app); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 14px 16px; white-space: pre-wrap; word-break: break-word; margin: 0; min-height: 200px; max-height: 70vh; overflow-y: auto; color: var(--text-primary); }
-
 /* LLM 调用日志折叠卡片 */
 .llm-log-list { display: flex; flex-direction: column; gap: 8px; }
 .llm-log-card { border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: var(--bg-app); overflow: hidden; }
@@ -198,6 +190,18 @@ textarea.form-input.disabled, textarea.form-input:disabled { opacity: .55; curso
 .llm-log-body { border-top: 1px solid var(--border-color); background: var(--bg-card); }
 .llm-log-toolbar { display: flex; justify-content: flex-end; padding: 8px 12px 0; }
 .llm-log-full { margin: 0; padding: 4px 16px 14px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; color: var(--text-primary); max-height: 60vh; overflow-y: auto; }
+.llm-log-full.llm-log-placeholder { display: flex; align-items: center; gap: 8px; padding: 16px; color: var(--text-secondary); font-size: 13px; }
+.llm-log-meta { display: flex; align-items: center; gap: 6px; flex: 0 1 auto; min-width: 0; overflow: hidden; font-size: 11px; color: var(--text-secondary); white-space: nowrap; }
+.llm-log-meta .badge { padding: 2px 8px; font-size: 11px; }
+.llm-log-status { flex: 0 0 auto; min-width: 44px; display: flex; align-items: center; justify-content: flex-end; font-size: 11px; color: var(--text-secondary); }
+.llm-log-status .spinner { width: 12px; height: 12px; border-width: 2px; }
+.llm-log-status.ready { color: var(--color-success); }
+.llm-log-status.error { color: var(--color-danger); }
+
+/* LLM 日志分页条 */
+.llm-pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 16px; }
+.llm-pager .btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+.llm-page-info { font-size: 13px; color: var(--text-secondary); }
 
 /* 加载指示器 */
 .llm-loading { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 40px 0; color: var(--text-secondary); font-size: 14px; }
@@ -207,6 +211,7 @@ textarea.form-input.disabled, textarea.form-input:disabled { opacity: .55; curso
 /* base64 图片折叠 chip */
 .b64-chip { display: inline-block; padding: 1px 8px; border-radius: var(--radius-pill); background: var(--color-primary-light); color: var(--color-primary); font-size: 11px; font-weight: 600; cursor: pointer; user-select: none; vertical-align: baseline; }
 .b64-chip:hover { background: var(--color-primary); color: #fff; }
+.b64-chip.loading { opacity: 0.6; cursor: progress; }
 
 /* base64 图片预览 popover */
 .b64-popover { position: fixed; z-index: 3000; max-width: 360px; padding: 10px; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-sm); box-shadow: var(--shadow-md); opacity: 0; visibility: hidden; transition: opacity 0.15s; pointer-events: none; }

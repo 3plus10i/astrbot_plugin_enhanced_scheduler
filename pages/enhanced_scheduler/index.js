@@ -63,7 +63,7 @@ async function init() {
             document.querySelectorAll(".tab-view").forEach(v => v.classList.remove("active"));
             btn.classList.add("active");
             $("view-" + btn.getAttribute("data-tab")).classList.add("active");
-            if (btn.getAttribute("data-tab") === "llm" && !llmLoaded) loadLlmLogs();
+            if (btn.getAttribute("data-tab") === "llm" && !llmLoaded) loadLlmLogs(0);
         });
     });
 
@@ -166,77 +166,183 @@ async function init() {
         $("config-llm-log-retention").value = cfg.llm_log_retention != null ? cfg.llm_log_retention : 10;
     }
 
-    // ── LLM 调用日志（按条折叠卡片） ──
+    // ── LLM 调用日志（分页骨架 + 逐条加载；正文展开时才渲染，图片点击才取） ──
     let llmLoaded = false;
-    const LLM_PREVIEW_LEN = 200;
-    const B64_RE = /data:image\/[\w.+-]+;base64,[A-Za-z0-9+/=_-]+/g;
+    let llmPage = 0;
+    let llmTotal = 0;
+    let llmLoadToken = 0;  // 切页/刷新时自增，作废在途请求
+    const LLM_PAGE_SIZE = 10;
+    const llmDetailCache = new Map();  // 记录文件名 -> 正文
+    const llmImageCache = new Map();   // 图片文件名 -> data URL
+    // 后端抽离图片后写入的占位标记：[img:<md5>.<ext>:<字节数>]
+    const IMG_MARK_RE = /\[img:([0-9a-f]{32})\.[a-z0-9]{2,5}:(\d+)\]/g;
 
+    function fmtSize(n) {
+        n = Number(n) || 0;
+        if (n < 1024) return n + " B";
+        if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+        return (n / 1048576).toFixed(2) + " MB";
+    }
+    function fmtDuration(ms) {
+        return (Math.round((Number(ms) || 0) / 100) / 10) + "s";
+    }
+    function yieldToUi() { return new Promise(r => setTimeout(r, 0)); }
     function showLlmLoading() {
         $("llm-log-list").innerHTML = `<div class="llm-loading"><span class="spinner"></span>正在加载…</div>`;
+        $("llm-pager").innerHTML = "";
     }
-    async function loadLlmLogs() {
+    async function loadLlmLogs(page) {
+        if (typeof page === "number") llmPage = page;
+        const token = ++llmLoadToken;
         showLlmLoading();
+        let res;
         try {
-            const res = await bridge.apiGet("get_llm_logs", { limit: 200 });
-            if (!res || res.status !== "success") { showToast("获取 LLM 日志失败", true); return; }
-            renderLlmLogs(res.entries || []);
-            llmLoaded = true;
+            res = await bridge.apiGet("get_llm_logs", { limit: LLM_PAGE_SIZE, offset: llmPage * LLM_PAGE_SIZE });
         } catch (e) {
+            if (token !== llmLoadToken) return;
             $("llm-log-list").innerHTML = `<div class="empty-hint">加载失败：${escapeHtml(e.message)}</div>`;
             showToast("加载 LLM 日志失败: " + e.message, true);
-        }
-    }
-    // 把文本里的 base64 图片 data URL 折叠成 chip，返回 HTML 与原始 base64 列表
-    function foldBase64(text) {
-        const b64List = [];
-        let html = "", last = 0, m;
-        B64_RE.lastIndex = 0;
-        while ((m = B64_RE.exec(text)) !== null) {
-            html += escapeHtml(text.slice(last, m.index));
-            const idx = b64List.length;
-            b64List.push(m[0]);
-            html += `<span class="b64-chip" data-idx="${idx}" title="点击复制 base64 内容">base64图片</span>`;
-            last = B64_RE.lastIndex;
-        }
-        html += escapeHtml(text.slice(last));
-        return { html, b64List };
-    }
-    // 按 formatted 渲染某条卡片内容；默认 false = 原始格式
-    function renderLlmContent(card, formatted) {
-        const text = formatted ? JSON.stringify(card._entry, null, 2) : JSON.stringify(card._entry);
-        const { html, b64List } = foldBase64(text);
-        card._b64List = b64List;
-        card._formatted = formatted;
-        card.querySelector(".llm-log-full").innerHTML = html;
-        const btn = card.querySelector(".llm-format-toggle");
-        if (btn) btn.textContent = formatted ? "原始格式" : "将JSON格式化";
-    }
-    function renderLlmLogs(entries) {
-        const list = $("llm-log-list");
-        if (!entries.length) {
-            list.innerHTML = `<div class="empty-hint">暂无记录。</div>`;
             return;
         }
-        list.innerHTML = entries.map(e => {
-            const preview = JSON.stringify(e).slice(0, LLM_PREVIEW_LEN);
+        if (token !== llmLoadToken) return;
+        if (!res || res.status !== "success") {
+            $("llm-log-list").innerHTML = `<div class="empty-hint">获取 LLM 日志失败。</div>`;
+            showToast("获取 LLM 日志失败", true);
+            return;
+        }
+        llmTotal = res.total || 0;
+        llmLoaded = true;
+        // 记录被裁剪后当前页可能越界，回到最后一页
+        const maxPage = Math.max(0, Math.ceil(llmTotal / LLM_PAGE_SIZE) - 1);
+        if (llmPage > maxPage) return loadLlmLogs(maxPage);
+        const entries = res.entries || [];
+        if (!entries.length) {
+            $("llm-log-list").innerHTML = `<div class="empty-hint">暂无记录。</div>`;
+            renderLlmPager();
+            return;
+        }
+        const cards = renderLlmPlaceholders(entries);
+        renderLlmPager();
+        // 串行逐条取正文：到达一条即就绪一条，可展开一条
+        for (const card of cards) {
+            if (token !== llmLoadToken) return;
+            await loadLlmCard(card, token);
+            await yieldToUi();
+        }
+    }
+    // 一次性占位整页折叠条，正文区先显示加载占位
+    function renderLlmPlaceholders(entries) {
+        const list = $("llm-log-list");
+        list.innerHTML = entries.map(m => {
+            const modeCN = m.mode === "conversation" ? "对话AI" : "独立AI";
+            const imgInfo = (m.images && m.images.length) ? ` · ${m.images.length}图 ${fmtSize(m.image_bytes)}` : "";
             return `
                 <details class="llm-log-card">
                     <summary class="llm-log-summary">
-                        <span class="llm-log-time">${escapeHtml(e.time || "")}</span>
-                        <span class="llm-log-preview">${escapeHtml(preview)}</span>
+                        <span class="llm-log-time">${escapeHtml(m.time || "")}</span>
+                        <span class="llm-log-meta">
+                            <span class="badge ${m.mode === "conversation" ? "badge-llm" : "badge-fixed"}">${modeCN}</span>
+                            <span class="badge ${m.ok ? "badge-active" : "badge-failed"}">${m.ok ? "成功" : "失败"}</span>
+                            <span>${escapeHtml(m.task_name || "")}</span>
+                            <span>${escapeHtml(m.umo || "")}</span>
+                            <span>${fmtSize(m.text_bytes)}${imgInfo}</span>
+                            <span>${fmtDuration(m.duration_ms)}</span>
+                        </span>
+                        <span class="llm-log-preview">${escapeHtml(m.preview || "")}</span>
+                        <span class="llm-log-status"><span class="spinner"></span></span>
                     </summary>
                     <div class="llm-log-body">
                         <div class="llm-log-toolbar">
-                            <button type="button" class="btn btn-secondary btn-sm llm-format-toggle">格式化</button>
+                            <button type="button" class="btn btn-secondary btn-sm llm-format-toggle" hidden>格式化</button>
                         </div>
-                        <pre class="llm-log-full"></pre>
+                        <pre class="llm-log-full llm-log-placeholder"><span class="spinner"></span>正在加载本条…</pre>
                     </div>
                 </details>`;
         }).join("");
-        Array.from(list.querySelectorAll(".llm-log-card")).forEach((card, i) => {
-            card._entry = entries[i];
-            renderLlmContent(card, false);
+        const cards = Array.from(list.querySelectorAll(".llm-log-card"));
+        cards.forEach((card, i) => {
+            card._meta = entries[i];
+            card._name = entries[i].name;
+            // toggle 事件不冒泡，逐卡片绑定：首次展开时才把正文文本写入页面
+            card.addEventListener("toggle", () => {
+                if (card.open && card._entry && !card._rendered) renderLlmCardContent(card);
+            });
         });
+        return cards;
+    }
+    // 取单条正文并标记就绪（已展开则立即渲染）
+    async function loadLlmCard(card, token) {
+        const name = card._name;
+        let body = llmDetailCache.get(name);
+        if (!body) {
+            try {
+                const res = await bridge.apiGet("get_llm_log_detail", { name });
+                if (token !== llmLoadToken) return;
+                if (!res || res.status !== "success") throw new Error((res && res.message) || "加载失败");
+                body = res.body;
+                llmDetailCache.set(name, body);
+            } catch (e) {
+                if (token !== llmLoadToken) return;
+                const pre = card.querySelector(".llm-log-full");
+                pre.classList.remove("llm-log-placeholder");
+                pre.textContent = "加载失败：" + e.message;
+                setLlmStatus(card, "error", "失败");
+                return;
+            }
+        }
+        card._entry = body;
+        setLlmStatus(card, "ready", "已就绪");
+        const pre = card.querySelector(".llm-log-full");
+        pre.classList.remove("llm-log-placeholder");
+        pre.textContent = "";
+        const btn = card.querySelector(".llm-format-toggle");
+        if (btn) btn.hidden = false;
+        if (card.open) renderLlmCardContent(card);
+    }
+    function setLlmStatus(card, state, text) {
+        const el = card.querySelector(".llm-log-status");
+        if (!el) return;
+        el.className = "llm-log-status " + state;
+        el.textContent = text;
+    }
+    function renderLlmPager() {
+        const pager = $("llm-pager");
+        if (!pager) return;
+        const pages = Math.max(1, Math.ceil(llmTotal / LLM_PAGE_SIZE));
+        const page = Math.min(llmPage, pages - 1);
+        pager.innerHTML = `
+            <button class="btn btn-secondary btn-sm" id="llm-page-prev" ${page <= 0 ? "disabled" : ""}>上一页</button>
+            <span class="llm-page-info">第 ${page + 1} / ${pages} 页 · 共 ${llmTotal} 条</span>
+            <button class="btn btn-secondary btn-sm" id="llm-page-next" ${page >= pages - 1 ? "disabled" : ""}>下一页</button>`;
+        const prev = $("llm-page-prev"), next = $("llm-page-next");
+        if (prev) prev.addEventListener("click", () => { if (page > 0) loadLlmLogs(page - 1); });
+        if (next) next.addEventListener("click", () => { if (page < pages - 1) loadLlmLogs(page + 1); });
+    }
+    // 把正文里的图片占位标记折叠成 chip，返回 HTML 与图片引用列表
+    function foldImages(text) {
+        const imgList = [];
+        let html = "", last = 0, m;
+        IMG_MARK_RE.lastIndex = 0;
+        while ((m = IMG_MARK_RE.exec(text)) !== null) {
+            html += escapeHtml(text.slice(last, m.index));
+            const idx = imgList.length;
+            imgList.push({ name: `${m[1]}.${m[2]}`, size: Number(m[3]) || 0 });
+            html += `<span class="b64-chip" data-idx="${idx}" title="点击加载图片">图片 ${escapeHtml(m[2].toUpperCase())} · ${fmtSize(m[3])}</span>`;
+            last = IMG_MARK_RE.lastIndex;
+        }
+        html += escapeHtml(text.slice(last));
+        return { html, imgList };
+    }
+    // 按卡片当前格式渲染正文（首次展开或切换格式时调用）
+    function renderLlmCardContent(card) {
+        if (!card._entry) return;
+        const text = card._formatted ? JSON.stringify(card._entry, null, 2) : JSON.stringify(card._entry);
+        const { html, imgList } = foldImages(text);
+        card._imgList = imgList;
+        card._rendered = true;
+        card.querySelector(".llm-log-full").innerHTML = html;
+        const btn = card.querySelector(".llm-format-toggle");
+        if (btn) btn.textContent = card._formatted ? "原始格式" : "将JSON格式化";
     }
     async function copyToClipboard(text) {
         try {
@@ -285,20 +391,42 @@ async function init() {
         }
         pop.classList.add("show");
     }
-    $("llm-log-list").addEventListener("click", ev => {
+    $("llm-log-list").addEventListener("click", async ev => {
         const chip = ev.target.closest(".b64-chip");
         if (chip) {
             const card = chip.closest(".llm-log-card");
             const idx = parseInt(chip.getAttribute("data-idx"), 10);
-            const dataUrl = (card && card._b64List && card._b64List[idx]) || "";
-            if (dataUrl) showB64Popover(chip, dataUrl);
-            else showToast("未找到图片内容", true);
+            const img = (card && card._imgList && card._imgList[idx]) || null;
+            if (!img) { showToast("未找到图片内容", true); return; }
+            // 图片按内容地址缓存：同一张图在任意记录中出现都只取一次
+            if (!img._dataUrl) {
+                chip.classList.add("loading");
+                try {
+                    let dataUrl = llmImageCache.get(img.name);
+                    if (!dataUrl) {
+                        const res = await bridge.apiGet("get_llm_image", { name: img.name });
+                        if (!res || res.status !== "success") throw new Error((res && res.message) || "加载失败");
+                        dataUrl = res.data_url;
+                        llmImageCache.set(img.name, dataUrl);
+                    }
+                    img._dataUrl = dataUrl;
+                } catch (e) {
+                    showToast("图片加载失败：" + e.message, true);
+                    return;
+                } finally {
+                    chip.classList.remove("loading");
+                }
+            }
+            showB64Popover(chip, img._dataUrl);
             return;
         }
         const btn = ev.target.closest(".llm-format-toggle");
         if (btn) {
             const card = btn.closest(".llm-log-card");
-            if (card) renderLlmContent(card, !card._formatted);
+            if (card && card._entry) {
+                card._formatted = !card._formatted;
+                renderLlmCardContent(card);
+            }
         }
     });
     document.addEventListener("click", async ev => {
@@ -314,7 +442,7 @@ async function init() {
         const pop = $("b64-popover");
         if (pop) pop.classList.remove("show");
     });
-    $("refresh-llm-btn").addEventListener("click", loadLlmLogs);
+    $("refresh-llm-btn").addEventListener("click", () => { llmDetailCache.clear(); loadLlmLogs(llmPage); });
     $("clear-llm-btn").addEventListener("click", () => {
         confirmMode = "clear-llm";
         $("confirm-modal-text").textContent = "确定要清空所有 LLM 调用日志吗？此操作不可撤销。";
@@ -800,7 +928,13 @@ async function init() {
         try {
             if (confirmMode === "clear-llm") {
                 const res = await bridge.apiPost("clear_llm_logs", {});
-                if (res && res.status === "success") { showToast("LLM 日志已清空"); closeConfirm(); llmLoaded = false; await loadLlmLogs(); }
+                if (res && res.status === "success") {
+                    showToast("LLM 日志已清空");
+                    closeConfirm();
+                    llmDetailCache.clear();
+                    llmImageCache.clear();
+                    await loadLlmLogs(0);
+                }
                 else showToast("清空失败: " + (res && res.message || ""), true);
             } else {
                 if (!pendingDeleteId) { okBtn.disabled = false; okBtn.textContent = "确定"; return; }

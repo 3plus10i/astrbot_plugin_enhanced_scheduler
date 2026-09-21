@@ -32,7 +32,7 @@ WebUI → 插件管理 → 找到「增强计划任务」→ 进入 Pages 页面
 | `poll_interval` | int | 60 | 兜底轮询间隔（秒）。仅在无主动触发器或调度计算失败时生效；正常时按最近触发点自适应唤醒，不受此值影响 |
 | `log_retention` | int | 200 | 内存中保留最近多少条触发/执行日志。最小 10 |
 | `llm_timeout` | int | 60 | AI 单次生成超时（秒）。最小 5 |
-| `llm_log_retention` | int | 10 | 独立文件 `llm_calls.jsonl` 保留最近多少条 AI 调用记录（含完整请求体）。最小 10 |
+| `llm_log_retention` | int | 10 | 日志目录中保留最近多少条 AI 调用记录（一条记录一个文件，含完整请求体与图片）。最小 10 |
 
 ---
 
@@ -234,48 +234,32 @@ default:GroupMessage:xxxxxx
 
 ---
 
-## LLM 调用日志（独立文件）
+## LLM 调用日志（一记录一文件）
 
-当任务内容使用「独立 AI」或「对话 AI」模式时，每次真正调用 AI 都会往独立文件 `data_dir/llm_calls.jsonl` 追加一条记录（**append-only**，JSONL，一行一条），成功与失败都记。每条包含：
+当任务内容使用「独立 AI」或「对话 AI」模式时，每次真正调用 AI 都会在 `data_dir/llm_logs/rec/` 下写**一条记录一个文件**，成功与失败都记。文件包含：
 
-- **完整请求体**：`request.system_prompt`（最终系统提示，含 `on_llm_request` 广播注入的人格/记忆）、`request.contexts`（注入的上下文消息历史）、`request.prompt`（最终用户提示词）、`provider_id`、`model`
-- **AI 回复**：`response.role`、`response.completion_text`（正文）、`response.reasoning_content`（推理内容，若有）、`response.usage`（input/output/total tokens）
-- 元信息：`time`、`task_id`、`task_name`、`source`（定时/手动）、`mode`（standalone/conversation）、`umo`、`ok`、`duration_ms`、`error`
+- **首行**：元数据（`time`、`task_id`、`task_name`、`source`、`mode`、`umo`、`ok`、`duration_ms`、`error`、`usage`、正文体积、图片清单、单行预览），列表只需读这一行
+- **次行起**：正文（`request` 完整请求体 + `response` AI 回复，图片位置为 `[img:<md5>.<ext>:<字节数>]` 占位标记，图片本体存放在 `data_dir/llm_logs/img/`）
 
-示例（对话模式，含人格与记忆注入后的最终请求）：
+文件名形如 `20260920-205903.123_随机问候_000042.json`：时间前缀（毫秒精度、定宽）保证字典序即时间序，任务名便于肉眼识别，序号保证同毫秒同名不冲突。**没有单独的索引文件**——"最近 N 条"直接由文件名排序得到。
 
-```json
-{
-  "time": "2026-09-04 22:35:00",
-  "task_id": "uuid",
-  "task_name": "随机问候",
-  "source": "scheduled",
-  "mode": "conversation",
-  "umo": "default:FriendMessage:xxxx",
-  "ok": true,
-  "duration_ms": 2314,
-  "request": {
-    "provider_id": "openai",
-    "model": "gpt-4o-mini",
-    "system_prompt": "你是助手，一个……（人格注入）……\n[记忆] 用户最近……",
-    "contexts": [{"role":"user","content":"……"}],
-    "prompt": "现在时间是2026-09-04 22:35:00，你被一个随机触发规则唤醒……"
-  },
-  "response": {
-    "role": "assistant",
-    "completion_text": "嗨，这么晚还没睡吗……",
-    "reasoning_content": "",
-    "usage": {"input": 512, "output": 34, "total": 546}
-  },
-  "error": null
-}
-```
+**图片内容寻址（去重）**：写入时把记录中的 base64 图片抽离为 `img/<md5>.<ext>`，同一张图片在任何记录、任何任务中只存一份；正文里只留占位标记。因此相邻记录（如 `B = A + 几段新对话`）共用的图片不会重复占用磁盘，也不会重复传输。解码失败的段落原样保留，不丢数据。
 
 说明：
 
 - 记录的是**广播注入后、真正交给 `context.llm_generate` 的最终请求体**——`conversation` 模式在调用前会注入人格 + 会话历史并广播 `on_llm_request`，故 `system_prompt`/`contexts` 已包含人格、记忆等插件注入；`standalone` 模式不注入人格、不广播，`system_prompt` 为该任务自己的提示。
-- 请求体可能很大（记忆/上下文），故保留条数由 `llm_log_retention` 控制（超限自动裁剪，保留最近 N 条）。
-- WebUI 新增「LLM 调用日志」标签页：直接展示 `llm_calls.jsonl` 的**原始文件内容**（不渲染、不自动刷新，纯 debug 查看），支持手动刷新、清空。
+- **过期管理**：记录数超过 2 倍 `llm_log_retention` 时裁剪到最近 N 条（删除最旧的记录文件），随后扫描剩余记录首行元数据，回收不再被任何记录引用的图片。
+- **旧数据迁移**：启动时若发现旧版单文件 `llm_calls.jsonl`，会自动拆分为逐条记录文件并抽离图片，迁移完成后原文件改名为 `llm_calls.jsonl.migrated` 保留（可手动删除）。
+
+### 页面行为
+
+「LLM 调用日志」标签页按页浏览（每页 10 条，可上一页/下一页）：
+
+1. 进入页面只请求当页元数据，立即渲染整页折叠卡片骨架（时间、任务名、模式、UMO、体积、耗时、预览），显示"加载中"状态位
+2. 随后**串行逐条**获取正文，加载一条即就绪一条、可展开一条，直到本页全部就绪
+3. 正文文本在卡片**首次展开**时才渲染进页面，避免多条大体积文本同时渲染造成卡顿
+4. 图片位置显示徽标（格式 + 体积），**点击徽标才真正加载图片**；同一图片第二次出现直接命中浏览器缓存，不再请求
+5. 已加载的正文与图片在浏览器端按内容缓存：翻回看过的页、重复的图片零请求；切换页码或刷新会作废在途请求
 
 ---
 
@@ -297,7 +281,9 @@ astrbot_plugin_enhanced_scheduler/
 持久化数据写在 `data/plugins/astrbot_plugin_enhanced_scheduler/` 下（AstrBot 推荐的 `StarTools.get_data_dir` 路径），不在插件自身目录里——升级/重装不会丢配置：
 
 - `tasks.json`：任务与内存日志
-- `llm_calls.jsonl`：LLM 调用日志（完整请求体 + 回复，append-only）
+- `llm_logs/rec/<时间>_<任务名>_<序号>.json`：LLM 调用记录，一条一个文件（首行元数据 + 正文）
+- `llm_logs/img/<md5>.<ext>`：记录中的图片，按内容寻址，跨记录复用
+- `llm_calls.jsonl.migrated`：旧版单文件日志的迁移备份（仅升级时出现，可手动删除）
 
 ## Web API
 
@@ -314,9 +300,10 @@ astrbot_plugin_enhanced_scheduler/
 | `/validate` | POST | 校验触发器组与逻辑规则，返回下次触发预览 |
 | `/preview_next` | POST | 给定触发器列表，返回下次触发时间 |
 | `/trigger_now` | POST | 立即手动触发一次任务（忽略触发规则与启用状态，仅执行内容并发送） |
-| `/get_llm_logs` | GET | 分页读取 `llm_calls.jsonl`（`limit`/`offset`，最新在前） |
-| `/get_llm_logs_raw` | GET | 返回 `llm_calls.jsonl` 原始文件内容（不解析，供 debug 直接查看） |
-| `/clear_llm_logs` | POST | 清空 `llm_calls.jsonl` |
+| `/get_llm_logs` | GET | 轻量元数据分页（`limit` 默认 10、`offset`，最新在前），只读记录文件首行 |
+| `/get_llm_log_detail` | GET | 按文件名取单条记录正文（图片为占位标记，已被裁剪时返回过期错误） |
+| `/get_llm_image` | GET | 按内容寻址取图片（`name=<md5>.<ext>`），返回 data URL |
+| `/clear_llm_logs` | POST | 清空全部 LLM 调用记录文件与图片池 |
 
 ## 已知限制
 
@@ -329,4 +316,4 @@ astrbot_plugin_enhanced_scheduler/
 
 ## 版本
 
-- `1.1.0`
+- `1.2.0`

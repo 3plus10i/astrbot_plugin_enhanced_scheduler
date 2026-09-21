@@ -12,7 +12,7 @@
             <div class="header-left">
                 <span class="back-btn" id="back-btn">← 返回</span>
                 <h1 class="page-title">增强计划任务</h1>
-                <span class="plugin-version">v1.1.0</span>
+                <span class="plugin-version">v1.2.0</span>
             </div>
             <div class="header-right">
                 <div class="tab-nav">
@@ -91,7 +91,7 @@
                     <div class="card-header">
                         <div class="card-header-title-group">
                             <h2 class="card-title">LLM 调用日志</h2>
-                            <span class="form-hint" style="font-weight:400;">按条折叠展示，点击展开查看完整请求与回复</span>
+                            <span class="form-hint" style="font-weight:400;">每页 10 条，逐条加载；点击展开查看完整请求与回复，图片点击才加载</span>
                         </div>
                         <div style="display:flex;gap:8px;">
                             <button class="btn btn-secondary" id="refresh-llm-btn"><span>刷新</span></button>
@@ -100,6 +100,7 @@
                     </div>
                     <div class="card-body">
                         <div class="llm-log-list" id="llm-log-list"><div class="empty-hint">暂无记录。</div></div>
+                        <div class="llm-pager" id="llm-pager"></div>
                     </div>
                 </div>
             </section>
@@ -128,7 +129,7 @@
                             <div class="form-group">
                                 <label class="form-label">LLM 调用日志保留条数</label>
                                 <input type="number" class="form-input" id="config-llm-log-retention" min="10" max="10000" required>
-                                <span class="form-hint">独立文件 llm_calls.jsonl 中保留最近多少条 AI 请求/回复记录（含完整请求体）。</span>
+                                <span class="form-hint">日志目录中保留最近多少条 AI 请求/回复记录（一条记录一个文件，含完整请求体与图片）。</span>
                             </div>
                             <div style="display:flex;justify-content:flex-end;margin-top:16px;">
                                 <button class="btn btn-primary" id="save-config-btn" type="submit"><span>保存配置</span></button>
