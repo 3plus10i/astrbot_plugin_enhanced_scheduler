@@ -93,7 +93,7 @@ AI 返回空内容、超时或报错时，该目标记为失败，不会退化�
 
 ## 发送对象
 
-发送对象是 AstrBot 的 UMO 字符串，格式为 `平台:消息类型:标识`，例如 `default:FriendMessage:1141847586`。
+发送对象是 AstrBot 的 UMO 字符串，格式为 `平台:消息类型:标识`，例如 `default:FriendMessage:xxx`。
 
 页面的下拉框会自动列出活跃会话，也可以手动输入。一个任务可以绑多个目标，逐个发送，各自独立记成功与失败。
 
@@ -119,7 +119,7 @@ AI 返回空内容、超时或报错时，该目标记为失败，不会退化�
     "time_aware": true,
     "holiday_aware": false
   },
-  "targets": ["default:FriendMessage:1141847586"]
+  "targets": ["default:FriendMessage:xxx"]
 }
 ```
 
