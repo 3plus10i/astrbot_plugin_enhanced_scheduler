@@ -508,6 +508,7 @@ async function init() {
         $("trigger-canvas").innerHTML = "";
         $("trigger-panel").innerHTML = "";
         $("targets-tags").innerHTML = "";
+        setJsonMode(false);
     }
     $("modal-close-btn").addEventListener("click", closeModal);
     $("modal-cancel-btn").addEventListener("click", closeModal);
@@ -518,6 +519,7 @@ async function init() {
 
     function openTaskModal(action, id) {
         const task = (action === "edit" && allTasks[id]) ? allTasks[id] : null;
+        setJsonMode(false);
         $("task-action").value = action;
         $("task-id").value = id || "";
         $("task-text").value = "";
@@ -966,17 +968,11 @@ async function init() {
         canvasViewport.classList.remove("panning");
     });
 
-    // ── 提交任务 ──
-    $("task-form").addEventListener("submit", async e => {
-        e.preventDefault();
-        const name = $("task-name").value.trim();
-        if (!name) { showToast("请填写任务名称", true); return; }
-        if (!triggers.length) { showToast("至少需要一个触发器", true); return; }
-        if (!activeTriggers().length) { showToast("至少需要一个主动型触发器（周期型或 cron 型）", true); return; }
-        if (!targets.length && $("task-text").value.trim()) { showToast("请至少选择一个发送对象", true); return; }
-        const payload = {
+    // ── 表单 ↔ JSON（进阶纯文本配置） ──
+    function buildTaskPayload() {
+        return {
             id: $("task-id").value || undefined,
-            name,
+            name: $("task-name").value.trim(),
             enabled: $("task-enabled").checked,
             triggers: triggers.map(t => ({ id: t.id, type: t.type, config: t.config })),
             content: {
@@ -988,6 +984,92 @@ async function init() {
             },
             targets: targets.slice(),
         };
+    }
+
+    // 把 JSON 回填到表单（未知类型的触发器会被忽略并提示）
+    function applyTaskPayload(obj) {
+        const c = obj.content || {};
+        $("task-name").value = obj.name || "";
+        $("task-enabled").checked = obj.enabled !== false;
+        $("task-mode").value = c.mode || "fixed";
+        $("task-text").value = c.text || "";
+        $("task-system-prompt").value = c.system_prompt || "";
+        $("task-time-aware").checked = c.time_aware !== false;
+        $("task-holiday-aware").checked = c.holiday_aware === true;
+
+        const raw = Array.isArray(obj.triggers) ? obj.triggers : [];
+        const unknown = raw.filter(t => !t || !TYPE_INFO[t.type]).length;
+        triggers = raw.filter(t => t && TYPE_INFO[t.type]).map((t, i) => ({
+            id: Number.isInteger(t.id) && t.id > 0 ? t.id : i + 1,
+            type: t.type,
+            config: (t.config && typeof t.config === "object" && !Array.isArray(t.config)) ? t.config : {},
+        }));
+        targets = (Array.isArray(obj.targets) ? obj.targets : []).map(String).filter(v => v.trim());
+        nextTriggerId = triggers.reduce((max, t) => Math.max(max, t.id), 0) + 1;
+        selectedTriggerId = triggers.length ? triggers[0].id : null;
+
+        renderTargets();
+        renderTriggerCanvas();
+        renderTriggerPanel();
+        updateContentMode();
+        updateValidateHints();
+        scheduleValidate();
+        if (unknown) showToast(`已忽略 ${unknown} 个类型未知的触发器`, true);
+    }
+
+    let jsonMode = false;
+    function setJsonMode(on) {
+        jsonMode = on;
+        $("task-form-body").style.display = on ? "none" : "";
+        $("task-json-body").style.display = on ? "" : "none";
+        $("task-json-toggle").innerHTML = `<span>${on ? "表单模式" : "JSON 模式"}</span>`;
+        if (on) $("task-json").value = JSON.stringify(buildTaskPayload(), null, 2);
+    }
+    $("task-json-toggle").addEventListener("click", () => {
+        if (!jsonMode) { setJsonMode(true); return; }
+        let obj;
+        try {
+            obj = JSON.parse($("task-json").value);
+            if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw new Error("顶层必须是对象");
+        } catch (e) {
+            showToast("JSON 解析失败：" + e.message, true);
+            return;
+        }
+        applyTaskPayload(obj);
+        setJsonMode(false);
+    });
+
+    function validateForm() {
+        if (!$("task-name").value.trim()) { showToast("请填写任务名称", true); return false; }
+        if (!triggers.length) { showToast("至少需要一个触发器", true); return false; }
+        if (!activeTriggers().length) { showToast("至少需要一个主动型触发器（周期型或 cron 型）", true); return false; }
+        if (!targets.length && $("task-text").value.trim()) { showToast("请至少选择一个发送对象", true); return false; }
+        return true;
+    }
+
+    // ── 提交任务 ──
+    $("task-form").addEventListener("submit", async e => {
+        e.preventDefault();
+        let payload;
+        if (jsonMode) {
+            try {
+                payload = JSON.parse($("task-json").value);
+            } catch (err) {
+                showToast("JSON 解析失败：" + err.message, true);
+                return;
+            }
+            if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+                showToast("JSON 顶层必须是对象", true);
+                return;
+            }
+            // id 以当前编辑的任务为准（新增时不带 id）
+            const editingId = $("task-id").value;
+            if (editingId) payload.id = editingId;
+            else delete payload.id;
+        } else {
+            if (!validateForm()) return;
+            payload = buildTaskPayload();
+        }
         const btn = $("modal-submit-btn");
         btn.disabled = true; btn.textContent = "保存中...";
         try {

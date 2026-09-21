@@ -12,7 +12,7 @@
             <div class="header-left">
                 <span class="back-btn" id="back-btn">← 返回</span>
                 <h1 class="page-title">增强计划任务</h1>
-                <span class="plugin-version">v1.3.1</span>
+                <span class="plugin-version">v1.3.2</span>
             </div>
             <div class="header-right">
                 <div class="tab-nav">
@@ -145,12 +145,22 @@
         <div class="modal-container modal-wide">
             <header class="modal-header">
                 <h3 class="modal-title" id="modal-title-text">新增计划任务</h3>
-                <span class="modal-close" id="modal-close-btn">×</span>
+                <div class="modal-header-actions">
+                    <button class="btn btn-secondary btn-sm" type="button" id="task-json-toggle"><span>JSON 模式</span></button>
+                    <span class="modal-close" id="modal-close-btn">×</span>
+                </div>
             </header>
             <form id="task-form" onsubmit="return false;">
                 <input type="hidden" id="task-id">
                 <input type="hidden" id="task-action" value="add">
-                <div class="modal-body">
+                <div class="modal-body" id="task-json-body" style="display:none;">
+                    <div class="form-group">
+                        <label class="form-label">任务 JSON（进阶）</label>
+                        <textarea class="form-input json-editor" id="task-json" spellcheck="false"></textarea>
+                        <span class="form-hint json-warning">除非你知道你在做什么，否则不要修改 JSON 配置。</span>
+                    </div>
+                </div>
+                <div class="modal-body" id="task-form-body">
                     <!-- 基本信息 -->
                     <div class="form-group">
                         <label class="form-label">任务名称</label>

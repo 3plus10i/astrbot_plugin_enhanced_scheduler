@@ -66,7 +66,7 @@ LEGACY_STANDALONE_SYSTEM_PROMPT = "<proactive_trigger>这是由计划任务自�
     PLUGIN_NAME,
     "3plus10i",
     "未来任务调度器，主动取或、被动取且的多触发器组合。",
-    "1.3.1",
+    "1.3.2",
 )
 class EnhancedSchedulerPlugin(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):

@@ -197,6 +197,9 @@ textarea.form-input.disabled, textarea.form-input:disabled { opacity: .55; curso
 .modal-close { cursor: pointer; color: var(--text-secondary); font-size: 24px; line-height: 1; padding: 4px 8px; }
 .modal-close:hover { color: var(--text-primary); }
 .modal-body { padding: 24px; }
+.modal-header-actions { display: flex; align-items: center; gap: 10px; }
+.json-editor { min-height: 360px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.55; white-space: pre; overflow-wrap: normal; overflow-x: auto; }
+.json-warning { color: var(--color-danger); font-weight: 600; }
 .modal-footer { padding: 16px 24px; border-top: 1px solid var(--border-color); display: flex; justify-content: flex-end; gap: 10px; position: sticky; bottom: 0; background: var(--bg-card); }
 
 .toast { position: fixed; bottom: 28px; right: 28px; padding: 14px 24px; background: var(--text-primary); color: var(--bg-card); font-size: 14px; font-weight: 600; border-radius: var(--radius-pill); box-shadow: var(--shadow-md); transform: translateY(40px); opacity: 0; visibility: hidden; transition: var(--transition-base); z-index: 2000; max-width: 80vw; }
