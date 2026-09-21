@@ -9,9 +9,9 @@
   "log_retention": {
     "type": "int",
     "description": "日志保留条数",
-    "hint": "内存中保留最近多少条触发/执行日志，供配置页面查看。默认 200 条。",
+    "hint": "保留最近多少条触发/执行日志（独立存于 run_logs.json），供配置页面查看。默认 100 条。",
     "obvious_hint": true,
-    "default": 200
+    "default": 100
   },
   "llm_timeout": {
     "type": "int",

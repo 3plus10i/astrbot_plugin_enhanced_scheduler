@@ -39,6 +39,8 @@ import scheduler_core as core
 
 PLUGIN_NAME = "astrbot_plugin_enhanced_scheduler"
 DATA_FILE_NAME = "tasks.json"
+# 运行日志：每次触发/跳过都记一条，条目多且与任务定义无关，单独存一个文件
+RUN_LOG_FILE_NAME = "run_logs.json"
 # LLM 调用日志：一条记录一个文件（首行元数据 + 次行正文），图片按内容寻址单独存放
 LLM_LOG_DIR_NAME = "llm_logs"
 LLM_REC_DIR_NAME = "rec"
@@ -66,7 +68,7 @@ LEGACY_STANDALONE_SYSTEM_PROMPT = "<proactive_trigger>这是由计划任务自�
     PLUGIN_NAME,
     "3plus10i",
     "未来任务调度器，主动取或、被动取且的多触发器组合。",
-    "1.3.2",
+    "1.3.3",
 )
 class EnhancedSchedulerPlugin(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):
@@ -77,6 +79,7 @@ class EnhancedSchedulerPlugin(Star):
         self.data_dir = str(StarTools.get_data_dir(PLUGIN_NAME))
         os.makedirs(self.data_dir, exist_ok=True)
         self.data_file = os.path.join(self.data_dir, DATA_FILE_NAME)
+        self.run_log_file = os.path.join(self.data_dir, RUN_LOG_FILE_NAME)
 
         # LLM 调用日志：记录目录（一条一个文件）+ 图片池（按内容 md5 寻址，跨记录复用）
         self.llm_log_dir = os.path.join(self.data_dir, LLM_LOG_DIR_NAME)
@@ -94,9 +97,11 @@ class EnhancedSchedulerPlugin(Star):
         # 节假日信息缓存（日期字符串 -> 「今天是…」子句，一天一次查询）
         self._holiday_cache: Dict[str, str] = {}
 
-        # 运行期数据
-        self.data: Dict[str, Any] = {"tasks": {}, "logs": []}
+        # 运行期数据：任务与运行日志分开存放
+        self.data: Dict[str, Any] = {"tasks": {}}
+        self.run_logs: List[Dict[str, Any]] = []
         self._load_data_sync()
+        self._load_run_logs_sync()
 
         # 后台轮询任务句柄
         self._poll_task: Optional[asyncio.Task] = None
@@ -144,10 +149,10 @@ class EnhancedSchedulerPlugin(Star):
 
     def _log_retention(self) -> int:
         try:
-            v = int(self.config.get("log_retention", 200))
+            v = int(self.config.get("log_retention", 100))
             return max(10, v)
         except (TypeError, ValueError):
-            return 200
+            return 100
 
     def _llm_timeout(self) -> int:
         try:
@@ -222,7 +227,6 @@ class EnhancedSchedulerPlugin(Star):
             except Exception as e:
                 logger.error(f"[EnhancedScheduler] 读取数据失败，使用空数据: {e}")
         self.data.setdefault("tasks", {})
-        self.data.setdefault("logs", [])
         # 数据迁移：
         #   use_llm(bool) -> mode(fixed/standalone/conversation)
         #   取消逻辑组合 -> 删除 logic_expr（改由"主动或/被动且"固定语义）
@@ -267,6 +271,40 @@ class EnhancedSchedulerPlugin(Star):
             os.replace(tmp, self.data_file)
         except Exception as e:
             logger.error(f"[EnhancedScheduler] 保存数据失败: {e}")
+
+    def _load_run_logs_sync(self):
+        """加载运行日志；同时把旧版存在 tasks.json 里的 logs 迁移到独立文件。"""
+        if os.path.exists(self.run_log_file):
+            try:
+                with open(self.run_log_file, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    self.run_logs = [e for e in loaded if isinstance(e, dict)]
+            except Exception as e:
+                logger.error(f"[EnhancedScheduler] 读取运行日志失败，使用空日志: {e}")
+        legacy = self.data.pop("logs", None)
+        if legacy is None:
+            return
+        if isinstance(legacy, list):
+            for entry in legacy:
+                if isinstance(entry, dict):
+                    self._append_log(entry)
+        self._save_data_io()
+        self._save_run_logs_io()
+        logger.info(f"[EnhancedScheduler] 运行日志已从 tasks.json 迁移到 {RUN_LOG_FILE_NAME}")
+
+    async def _save_run_logs(self):
+        async with self._lock:
+            await asyncio.to_thread(self._save_run_logs_io)
+
+    def _save_run_logs_io(self):
+        try:
+            tmp = self.run_log_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.run_logs, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.run_log_file)
+        except Exception as e:
+            logger.error(f"[EnhancedScheduler] 保存运行日志失败: {e}")
 
     # ─────────────────────────────────────────────────────────────
     # 后台轮询
@@ -314,6 +352,7 @@ class EnhancedSchedulerPlugin(Star):
         now = time.time()
         tasks = self.data.get("tasks", {})
         changed = False
+        logged = False
 
         for task_id, task in list(tasks.items()):
             if not task.get("enabled", True):
@@ -353,6 +392,7 @@ class EnhancedSchedulerPlugin(Star):
                     "detail": "跳过（被动触发器条件未全部满足，未执行动作）",
                 })
                 changed = True
+                logged = True
                 continue
 
             # 执行任务；success 表示"成功执行了动作"（含空动作视为成功）
@@ -375,9 +415,12 @@ class EnhancedSchedulerPlugin(Star):
                 "detail": detail,
             })
             changed = True
+            logged = True
 
         if changed:
             await self._save_data()
+        if logged:
+            await self._save_run_logs()
 
     # ─────────────────────────────────────────────────────────────
     # 任务执行
@@ -769,12 +812,12 @@ class EnhancedSchedulerPlugin(Star):
     # ─────────────────────────────────────────────────────────────
 
     def _append_log(self, entry: dict):
-        logs = self.data.setdefault("logs", [])
-        logs.append(entry)
+        """追加一条运行日志（仅内存）；持久化由调用方在一个批次结束时统一执行。"""
+        self.run_logs.append(entry)
         # 截断保留最近 N 条
         retention = self._log_retention()
-        if len(logs) > retention:
-            del logs[: len(logs) - retention]
+        if len(self.run_logs) > retention:
+            del self.run_logs[: len(self.run_logs) - retention]
 
     # ─────────────────────────────────────────────────────────────
     # LLM 调用日志（一记录一文件，首行元数据 + 次行正文；图片按内容寻址单独存放）
@@ -1041,6 +1084,7 @@ class EnhancedSchedulerPlugin(Star):
         self.context.register_web_api(f"{prefix}/validate", self._api_validate, ["POST"], "校验触发器并预览未来触发时间")
         self.context.register_web_api(f"{prefix}/preview_next", self._api_preview_next, ["POST"], "预览下次触发时间")
         self.context.register_web_api(f"{prefix}/trigger_now", self._api_trigger_now, ["POST"], "立即手动触发一次任务")
+        self.context.register_web_api(f"{prefix}/get_run_logs", self._api_get_run_logs, ["GET"], "分页获取运行日志")
         self.context.register_web_api(f"{prefix}/get_llm_logs", self._api_get_llm_logs, ["GET"], "分页获取 LLM 调用日志元数据")
         self.context.register_web_api(f"{prefix}/get_llm_log_detail", self._api_get_llm_log_detail, ["GET"], "获取单条 LLM 调用日志正文")
         self.context.register_web_api(f"{prefix}/get_llm_image", self._api_get_llm_image, ["GET"], "按需获取日志中的图片")
@@ -1064,7 +1108,6 @@ class EnhancedSchedulerPlugin(Star):
                 t_copy["_next_fire"] = None
             tasks_out[tid] = t_copy
         resp["tasks"] = tasks_out
-        resp["logs"] = list(self.data.get("logs", []))
         return jsonify(resp)
 
     async def _api_save_config(self):
@@ -1380,9 +1423,23 @@ class EnhancedSchedulerPlugin(Star):
                 "source": "manual",
             })
             await self._save_data()
+            await self._save_run_logs()
             return jsonify({"status": "success", "action": action, "detail": detail})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
+
+    async def _api_get_run_logs(self):
+        """分页获取运行日志（最新在前）。日志存在独立的 run_logs.json，不随 get_data 全量下发。"""
+        from quart import request, jsonify
+        try:
+            limit = int(request.args.get("limit", 20))
+            offset = int(request.args.get("offset", 0))
+        except (TypeError, ValueError):
+            limit, offset = 20, 0
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        ordered = list(reversed(self.run_logs))
+        return jsonify({"status": "success", "total": len(ordered), "entries": ordered[offset : offset + limit]})
 
     async def _api_get_llm_logs(self):
         """轻量元数据分页（最新在前）。只读记录文件首行，不返回正文与图片。"""

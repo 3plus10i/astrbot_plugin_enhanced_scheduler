@@ -4,7 +4,6 @@ async function init() {
     try { await bridge.ready(); } catch (e) { console.error("bridge 连接失败:", e); }
 
     let allTasks = {};
-    let allLogs = [];
     let sessionsList = [];
     let validateTimer = null;
     const LOGS_PAGE_SIZE = 20;
@@ -61,8 +60,10 @@ async function init() {
             document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
             document.querySelectorAll(".tab-view").forEach(v => v.classList.remove("active"));
             btn.classList.add("active");
-            $("view-" + btn.getAttribute("data-tab")).classList.add("active");
-            if (btn.getAttribute("data-tab") === "llm" && !llmLoaded) loadLlmLogs(0);
+            const tab = btn.getAttribute("data-tab");
+            $("view-" + tab).classList.add("active");
+            if (tab === "logs") loadRunLogs(logsPage);
+            if (tab === "llm" && !llmLoaded) loadLlmLogs(0);
         });
     });
 
@@ -76,9 +77,7 @@ async function init() {
             const res = await bridge.apiGet("get_data", {});
             if (!res || res.status !== "success") { showToast("获取数据失败", true); return; }
             allTasks = res.tasks || {};
-            allLogs = res.logs || [];
             renderTasks();
-            renderLogs();
             renderConfig(res.config || {});
         } catch (e) {
             showToast("加载失败: " + e.message, true);
@@ -131,18 +130,28 @@ async function init() {
         attachTaskRowListeners();
     }
 
-    function renderLogs() {
+    async function loadRunLogs(page) {
+        if (typeof page === "number") logsPage = page;
         const body = $("logs-body");
-        if (!allLogs.length) {
-            body.innerHTML = `<tr><td colspan="6" class="table-empty">暂无日志。任务触发后会在此显示最近记录。</td></tr>`;
-            $("logs-pager").innerHTML = "";
-            logsPage = 0;
+        let res;
+        try {
+            res = await bridge.apiGet("get_run_logs", { limit: LOGS_PAGE_SIZE, offset: logsPage * LOGS_PAGE_SIZE });
+        } catch (e) {
+            showToast("加载运行日志失败: " + e.message, true);
             return;
         }
-        const sorted = allLogs.slice().reverse();
-        const pages = Math.max(1, Math.ceil(sorted.length / LOGS_PAGE_SIZE));
-        logsPage = Math.min(logsPage, pages - 1);
-        body.innerHTML = sorted.slice(logsPage * LOGS_PAGE_SIZE, (logsPage + 1) * LOGS_PAGE_SIZE).map(l => {
+        if (!res || res.status !== "success") { showToast("加载运行日志失败", true); return; }
+        const total = res.total || 0;
+        const pages = Math.max(1, Math.ceil(total / LOGS_PAGE_SIZE));
+        // 日志被裁剪后当前页可能越界，回到最后一页
+        if (logsPage > pages - 1) return loadRunLogs(pages - 1);
+        const entries = res.entries || [];
+        if (!entries.length) {
+            body.innerHTML = `<tr><td colspan="6" class="table-empty">暂无日志。任务触发后会在此显示最近记录。</td></tr>`;
+            $("logs-pager").innerHTML = "";
+            return;
+        }
+        body.innerHTML = entries.map(l => {
             const tof = l.trigger_tof || {};
             const tofStr = Object.keys(tof).map(id => `#${id}:${tof[id] ? '✓' : '✗'}`).join(" ");
             const actionCN = {send_llm:"LLM发送",send_fixed:"发送文本",noop:"空动作",partial:"部分失败",skipped:"逻辑未过",failed:"失败"}[l.action] || l.action;
@@ -158,7 +167,7 @@ async function init() {
                 <td class="cell-wrap">${escapeHtml(detail)} ${escapeHtml(targetsInfo)}</td>
             </tr>`;
         }).join("");
-        renderLogsPager(pages, sorted.length);
+        renderLogsPager(pages, total);
     }
 
     function renderLogsPager(pages, total) {
@@ -168,16 +177,16 @@ async function init() {
             <span class="page-info">第 ${logsPage + 1} / ${pages} 页 · 共 ${total} 条</span>
             <button class="btn btn-secondary btn-sm" id="logs-page-next" ${logsPage >= pages - 1 ? "disabled" : ""}>下一页</button>`;
         $("logs-page-prev").addEventListener("click", () => {
-            if (logsPage > 0) { logsPage--; renderLogs(); }
+            if (logsPage > 0) loadRunLogs(logsPage - 1);
         });
         $("logs-page-next").addEventListener("click", () => {
-            if (logsPage < pages - 1) { logsPage++; renderLogs(); }
+            if (logsPage < pages - 1) loadRunLogs(logsPage + 1);
         });
     }
 
     function renderConfig(cfg) {
         $("config-poll-interval").value = cfg.poll_interval != null ? cfg.poll_interval : 60;
-        $("config-log-retention").value = cfg.log_retention != null ? cfg.log_retention : 200;
+        $("config-log-retention").value = cfg.log_retention != null ? cfg.log_retention : 100;
         $("config-llm-timeout").value = cfg.llm_timeout != null ? cfg.llm_timeout : 60;
         $("config-llm-log-retention").value = cfg.llm_log_retention != null ? cfg.llm_log_retention : 10;
     }
@@ -1163,7 +1172,7 @@ async function init() {
         e.preventDefault();
         const payload = {
             poll_interval: parseInt($("config-poll-interval").value) || 60,
-            log_retention: parseInt($("config-log-retention").value) || 200,
+            log_retention: parseInt($("config-log-retention").value) || 100,
             llm_timeout: parseInt($("config-llm-timeout").value) || 60,
             llm_log_retention: parseInt($("config-llm-log-retention").value) || 500,
         };
@@ -1177,13 +1186,13 @@ async function init() {
         finally { btn.disabled = false; btn.textContent = "保存配置"; }
     });
 
-    $("refresh-logs-btn").addEventListener("click", loadData);
+    $("refresh-logs-btn").addEventListener("click", () => loadRunLogs(logsPage));
 
     // ── 初始化 ──
     await loadSessions();
     await loadData();
     setInterval(() => {
-        if ($("view-logs").classList.contains("active")) loadData();
+        if ($("view-logs").classList.contains("active")) loadRunLogs(logsPage);
     }, 8000);
 }
 

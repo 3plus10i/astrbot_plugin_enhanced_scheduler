@@ -15,7 +15,7 @@ WebUI → 插件管理 → 增强计划任务 → Pages 页面。任务的增删
 插件级配置共四项：
 
 - `poll_interval`，默认 60 秒。兜底轮询间隔，只在任务没有主动触发器、或调度计算失败时生效。正常情况按最近触发点自适应唤醒。
-- `log_retention`，默认 200。内存中保留的运行日志条数，最小 10。
+- `log_retention`，默认 100。保留的运行日志条数，最小 10。
 - `llm_timeout`，默认 60 秒。单次 AI 生成超时，最小 5。
 - `llm_log_retention`，默认 10。LLM 调用记录保留条数，最小 10。
 
@@ -178,7 +178,7 @@ AI 返回空内容、超时或报错时，该目标记为失败，不会退化�
 
 ## 日志与存储
 
-主动触发器到点时必记一条运行日志，无论被动条件是否满足、是否发送成功。手动触发会额外标注为 manual。日志字段包括时间、任务 id 与名称、各触发器本次真值、被动条件是否全部满足、动作类型、各目标结果与详情。日志存在内存中并持久化到 `tasks.json` 的 `logs`，保留 `log_retention` 条。
+主动触发器到点时必记一条运行日志，无论被动条件是否满足、是否发送成功。手动触发会额外标注为 manual。日志字段包括时间、任务 id 与名称、各触发器本次真值、被动条件是否全部满足、动作类型、各目标结果与详情。日志存在内存中并持久化到独立的 `run_logs.json`，保留 `log_retention` 条。页面按页向后端拉取，`get_data` 不再携带日志。旧版存在 `tasks.json` 里的日志会在启动时自动迁出。
 
 每次真正调用 AI 还会写一条 LLM 调用记录，成功失败都写，一条记录一个文件，放在 `llm_logs/rec/` 下：
 
@@ -203,7 +203,8 @@ astrbot_plugin_enhanced_scheduler/
 
 数据写在 `data/plugins/astrbot_plugin_enhanced_scheduler/` 下，升级或重装不会丢：
 
-- `tasks.json`：任务与运行日志
+- `tasks.json`：任务定义
+- `run_logs.json`：运行日志
 - `llm_logs/rec/`：LLM 调用记录，一条一个文件
 - `llm_logs/img/`：记录中的图片，按 md5 命名，跨记录复用
 - `llm_calls.jsonl.migrated`：旧版日志备份，仅升级时出现
@@ -214,7 +215,7 @@ astrbot_plugin_enhanced_scheduler/
 
 任务与配置：
 
-- `GET /get_data`：取全部任务、日志与配置，含预计算的下次触发时间
+- `GET /get_data`：取全部任务与配置，含预计算的下次触发时间
 - `POST /upsert_task`：新增或更新任务
 - `POST /delete_task`、`POST /copy_task`：删除、复制，副本默认停用
 - `POST /validate`：校验触发器，返回各主动触发器的未来触发点与整体下次检查时间
@@ -225,6 +226,7 @@ astrbot_plugin_enhanced_scheduler/
 
 日志：
 
+- `GET /get_run_logs`：运行日志分页，默认每页 20 条、最新在前
 - `GET /get_llm_logs`：轻量元数据分页，默认每页 10 条、最新在前
 - `GET /get_llm_log_detail`：按文件名取单条正文，已被裁剪时返回过期错误
 - `GET /get_llm_image`：按 md5 加扩展名取图片，返回 data URL
@@ -241,4 +243,4 @@ astrbot_plugin_enhanced_scheduler/
 
 ## 版本
 
-- `1.3.2`
+- `1.3.3`
