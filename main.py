@@ -66,7 +66,7 @@ LEGACY_STANDALONE_SYSTEM_PROMPT = "<proactive_trigger>这是由计划任务自�
     PLUGIN_NAME,
     "3plus10i",
     "未来任务调度器，主动取或、被动取且的多触发器组合。",
-    "1.3.0",
+    "1.3.1",
 )
 class EnhancedSchedulerPlugin(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):
@@ -934,19 +934,37 @@ class EnhancedSchedulerPlugin(Star):
             return None
 
     def _read_llm_image_io(self, name: str) -> Optional[str]:
-        """按内容寻址读取单张图片并转成 data URL（前端按 md5 缓存复用）。"""
+        """按内容寻址读取单张图片并转成 data URL（前端按 md5 缓存复用）。
+
+        文件名以 md5 为准：请求的文件名不存在时，回退到图片池中同一 md5 的实际文件
+        （扩展名以磁盘上的为准），避免历史标记里的扩展名与文件名不一致时取不到图。
+        """
         if not _IMG_NAME_RE.match(name or ""):
             return None
         path = os.path.join(self.llm_img_dir, name)
         if not os.path.exists(path):
-            return None
+            path = self._find_llm_image_io(name.split(".", 1)[0]) or ""
+            if not path:
+                return None
         try:
             with open(path, "rb") as f:
                 raw = f.read()
         except Exception:
             return None
         encoded = base64.b64encode(raw).decode("ascii")
-        return f"data:{_image_mime(name)};base64,{encoded}"
+        return f"data:{_image_mime(os.path.basename(path))};base64,{encoded}"
+
+    def _find_llm_image_io(self, md5: str) -> Optional[str]:
+        """按 md5 在图片池里找实际文件；不存在返回 None。"""
+        if not re.fullmatch(r"[0-9a-f]{32}", md5 or ""):
+            return None
+        try:
+            for fn in os.listdir(self.llm_img_dir):
+                if fn.startswith(md5 + "."):
+                    return os.path.join(self.llm_img_dir, fn)
+        except Exception:
+            pass
+        return None
 
     def _clear_llm_logs_io(self):
         try:
@@ -1402,7 +1420,7 @@ class EnhancedSchedulerPlugin(Star):
             name = str(request.args.get("name", "")).strip()
             data_url = await asyncio.to_thread(self._read_llm_image_io, name)
             if data_url is None:
-                return jsonify({"status": "error", "message": "图片不存在或已被回收"}), 404
+                return jsonify({"status": "error", "message": f"图片不存在或已被回收（{name}）"}), 404
             return jsonify({"status": "success", "data_url": data_url})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500

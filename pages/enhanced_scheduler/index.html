@@ -12,7 +12,7 @@
             <div class="header-left">
                 <span class="back-btn" id="back-btn">← 返回</span>
                 <h1 class="page-title">增强计划任务</h1>
-                <span class="plugin-version">v1.3.0</span>
+                <span class="plugin-version">v1.3.1</span>
             </div>
             <div class="header-right">
                 <div class="tab-nav">
@@ -81,6 +81,7 @@
                             </tbody>
                         </table>
                     </div>
+                    <div class="pager" id="logs-pager"></div>
                 </div>
             </section>
 
@@ -90,7 +91,6 @@
                     <div class="card-header">
                         <div class="card-header-title-group">
                             <h2 class="card-title">LLM 调用日志</h2>
-                            <span class="form-hint" style="font-weight:400;">每页 10 条，逐条加载；点击展开查看完整请求与回复，图片点击才加载</span>
                         </div>
                         <div style="display:flex;gap:8px;">
                             <button class="btn btn-secondary" id="refresh-llm-btn"><span>刷新</span></button>
@@ -99,7 +99,7 @@
                     </div>
                     <div class="card-body">
                         <div class="llm-log-list" id="llm-log-list"><div class="empty-hint">暂无记录。</div></div>
-                        <div class="llm-pager" id="llm-pager"></div>
+                        <div class="pager" id="llm-pager"></div>
                     </div>
                 </div>
             </section>
@@ -182,7 +182,7 @@
                         <div class="section-block-header">
                             <div>
                                 <label class="form-label">触发器设置</label>
-                                <span class="form-hint">主动型并排，之间取「或」：任一到点即检查条件；被动型串行，之间取「且」：全部满足才执行。点击节点展开配置。</span>
+                                <span class="form-hint">任意主动型触发，并且后续所有被动型激活，则可触发一次任务。</span>
                             </div>
                         </div>
                         <div class="trigger-canvas-viewport" id="trigger-canvas-viewport">
@@ -232,7 +232,6 @@
                                 </div>
                                 <label class="switch-toggle"><input type="checkbox" id="task-holiday-aware"><span class="slider"></span></label>
                             </div>
-                            <div class="content-mode-requirement" id="content-mode-requirement"></div>
                         </div>
                     </div>
                 </div>

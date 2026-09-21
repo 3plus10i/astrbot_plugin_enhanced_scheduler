@@ -7,6 +7,8 @@ async function init() {
     let allLogs = [];
     let sessionsList = [];
     let validateTimer = null;
+    const LOGS_PAGE_SIZE = 20;
+    let logsPage = 0;
 
     // ── 工具函数 ──
     function $(id) { return document.getElementById(id); }
@@ -133,10 +135,14 @@ async function init() {
         const body = $("logs-body");
         if (!allLogs.length) {
             body.innerHTML = `<tr><td colspan="6" class="table-empty">暂无日志。任务触发后会在此显示最近记录。</td></tr>`;
+            $("logs-pager").innerHTML = "";
+            logsPage = 0;
             return;
         }
         const sorted = allLogs.slice().reverse();
-        body.innerHTML = sorted.map(l => {
+        const pages = Math.max(1, Math.ceil(sorted.length / LOGS_PAGE_SIZE));
+        logsPage = Math.min(logsPage, pages - 1);
+        body.innerHTML = sorted.slice(logsPage * LOGS_PAGE_SIZE, (logsPage + 1) * LOGS_PAGE_SIZE).map(l => {
             const tof = l.trigger_tof || {};
             const tofStr = Object.keys(tof).map(id => `#${id}:${tof[id] ? '✓' : '✗'}`).join(" ");
             const actionCN = {send_llm:"LLM发送",send_fixed:"发送文本",noop:"空动作",partial:"部分失败",skipped:"逻辑未过",failed:"失败"}[l.action] || l.action;
@@ -152,6 +158,21 @@ async function init() {
                 <td class="cell-wrap">${escapeHtml(detail)} ${escapeHtml(targetsInfo)}</td>
             </tr>`;
         }).join("");
+        renderLogsPager(pages, sorted.length);
+    }
+
+    function renderLogsPager(pages, total) {
+        const pager = $("logs-pager");
+        pager.innerHTML = `
+            <button class="btn btn-secondary btn-sm" id="logs-page-prev" ${logsPage <= 0 ? "disabled" : ""}>上一页</button>
+            <span class="page-info">第 ${logsPage + 1} / ${pages} 页 · 共 ${total} 条</span>
+            <button class="btn btn-secondary btn-sm" id="logs-page-next" ${logsPage >= pages - 1 ? "disabled" : ""}>下一页</button>`;
+        $("logs-page-prev").addEventListener("click", () => {
+            if (logsPage > 0) { logsPage--; renderLogs(); }
+        });
+        $("logs-page-next").addEventListener("click", () => {
+            if (logsPage < pages - 1) { logsPage++; renderLogs(); }
+        });
     }
 
     function renderConfig(cfg) {
@@ -170,7 +191,7 @@ async function init() {
     const llmDetailCache = new Map();  // 记录文件名 -> 正文
     const llmImageCache = new Map();   // 图片文件名 -> data URL
     // 后端抽离图片后写入的占位标记：[img:<md5>.<ext>:<字节数>]
-    const IMG_MARK_RE = /\[img:([0-9a-f]{32})\.[a-z0-9]{2,5}:(\d+)\]/g;
+    const IMG_MARK_RE = /\[img:([0-9a-f]{32})\.([a-z0-9]{2,5}):(\d+)\]/g;
 
     function fmtSize(n) {
         n = Number(n) || 0;
@@ -307,22 +328,30 @@ async function init() {
         const page = Math.min(llmPage, pages - 1);
         pager.innerHTML = `
             <button class="btn btn-secondary btn-sm" id="llm-page-prev" ${page <= 0 ? "disabled" : ""}>上一页</button>
-            <span class="llm-page-info">第 ${page + 1} / ${pages} 页 · 共 ${llmTotal} 条</span>
+            <span class="page-info">第 ${page + 1} / ${pages} 页 · 共 ${llmTotal} 条</span>
             <button class="btn btn-secondary btn-sm" id="llm-page-next" ${page >= pages - 1 ? "disabled" : ""}>下一页</button>`;
         const prev = $("llm-page-prev"), next = $("llm-page-next");
         if (prev) prev.addEventListener("click", () => { if (page > 0) loadLlmLogs(page - 1); });
         if (next) next.addEventListener("click", () => { if (page < pages - 1) loadLlmLogs(page + 1); });
     }
-    // 把正文里的图片占位标记折叠成 chip，返回 HTML 与图片引用列表
-    function foldImages(text) {
+    // 把正文里的图片占位标记折叠成 chip，返回 HTML 与图片引用列表。
+    // 文件名/体积以记录首行元数据里的图片清单为准（标记文本仅作兜底），
+    // 避免标记被误读时拼出不存在的文件名。
+    function foldImages(text, metaImages) {
+        const metas = metaImages || [];
         const imgList = [];
         let html = "", last = 0, m;
         IMG_MARK_RE.lastIndex = 0;
         while ((m = IMG_MARK_RE.exec(text)) !== null) {
             html += escapeHtml(text.slice(last, m.index));
+            const md5 = m[1];
+            const info = metas.find(i => i && i.md5 === md5);
+            const name = (info && info.name) || `${md5}.${m[2]}`;
+            const size = info && info.size != null ? info.size : (Number(m[3]) || 0);
+            const ext = String(name).split(".").pop().toUpperCase();
             const idx = imgList.length;
-            imgList.push({ name: `${m[1]}.${m[2]}`, size: Number(m[3]) || 0 });
-            html += `<span class="b64-chip" data-idx="${idx}" title="点击加载图片">图片 ${escapeHtml(m[2].toUpperCase())} · ${fmtSize(m[3])}</span>`;
+            imgList.push({ name, size });
+            html += `<span class="b64-chip" data-idx="${idx}" title="点击加载图片">图片 ${escapeHtml(ext)} · ${fmtSize(size)}</span>`;
             last = IMG_MARK_RE.lastIndex;
         }
         html += escapeHtml(text.slice(last));
@@ -332,7 +361,7 @@ async function init() {
     function renderLlmCardContent(card) {
         if (!card._entry) return;
         const text = card._formatted ? JSON.stringify(card._entry, null, 2) : JSON.stringify(card._entry);
-        const { html, imgList } = foldImages(text);
+        const { html, imgList } = foldImages(text, card._meta && card._meta.images);
         card._imgList = imgList;
         card._rendered = true;
         card.querySelector(".llm-log-full").innerHTML = html;
@@ -447,7 +476,7 @@ async function init() {
     function attachTaskRowListeners() {
         document.querySelectorAll(".edit-task-btn").forEach(b => b.addEventListener("click", () => openTaskModal("edit", b.getAttribute("data-id"))));
         document.querySelectorAll(".copy-task-btn").forEach(b => b.addEventListener("click", () => copyTask(b.getAttribute("data-id"))));
-        document.querySelectorAll(".trigger-now-btn").forEach(b => b.addEventListener("click", () => triggerNow(b.getAttribute("data-id"))));
+        document.querySelectorAll(".trigger-now-btn").forEach(b => b.addEventListener("click", () => triggerNow(b.getAttribute("data-id"), b)));
         document.querySelectorAll(".delete-task-btn").forEach(b => b.addEventListener("click", () => confirmDelete(b.getAttribute("data-id"))));
     }
 
@@ -458,9 +487,9 @@ async function init() {
     const TYPE_INFO = {
         interval: { kind: "active", label: "主动-周期型", desc: "从基准时间开始，每经过周期触发一次" },
         cron: { kind: "active", label: "主动-cron型", desc: "按标准 5 段 cron 表达式（分 时 日 月 周）触发" },
-        window: { kind: "passive", label: "被动-区间型", desc: "被主动型触发器唤起后，若在指定时间段内则触发" },
-        random: { kind: "passive", label: "被动-随机型", desc: "被主动型触发器唤起后，以给定概率触发" },
-        cooldown: { kind: "passive", label: "被动-冷却型", desc: "被主动型触发器唤起后，若距上次成功超过冷却时长则触发" },
+        window: { kind: "passive", label: "被动-区间型", desc: "被主动型触发器唤起后，若在指定时间段内则激活" },
+        random: { kind: "passive", label: "被动-随机型", desc: "被主动型触发器唤起后，以给定概率激活" },
+        cooldown: { kind: "passive", label: "被动-冷却型", desc: "被主动型触发器唤起后，若本任务上次成功后到现在时间超过冷却时长则触发" },
     };
     const WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 
@@ -610,8 +639,10 @@ async function init() {
 
         const nodeHtml = (t, style) => `
             <div class="tnode ${TYPE_INFO[t.type].kind === "active" ? "active" : "passive"}${t.id === selectedTriggerId ? " selected" : ""}" data-tid="${t.id}" style="${style}">
-                <span class="tnode-id">${t.id}</span>
-                <span class="tnode-label">${TYPE_INFO[t.type].label}</span>
+                <span class="tnode-head">
+                    <span class="tnode-id">${t.id}</span>
+                    <span class="tnode-label">${TYPE_INFO[t.type].label}</span>
+                </span>
                 <span class="tnode-sub">${escapeHtml(triggerSummaryText(t))}</span>
             </div>`;
 
@@ -689,14 +720,14 @@ async function init() {
             const baseVal = toDatetimeLocal(c.base_time) || defaultBaseTime();
             return `
                 <div class="trigger-config-fields">
+                    <div class="full-row"><label class="form-hint">基准时间</label>
+                        <input type="datetime-local" class="form-input" data-field="base_time" value="${escapeHtml(baseVal)}"></div>
                     <div class="full-row interval-row">
                         <span class="interval-duration-label">周期时长</span>
                         <input type="number" class="form-input" data-field="days" min="0" value="${parseInt(c.days) || 0}"><span class="unit">天</span>
                         <input type="number" class="form-input" data-field="hours" min="0" value="${parseInt(c.hours) || 0}"><span class="unit">小时</span>
                         <input type="number" class="form-input" data-field="minutes" min="0" value="${parseInt(c.minutes) || 0}"><span class="unit">分钟</span>
                     </div>
-                    <div class="full-row"><label class="form-hint">基准时间（从此时间起按周期累加触发）</label>
-                        <input type="datetime-local" class="form-input" data-field="base_time" value="${escapeHtml(baseVal)}"></div>
                 </div>`;
         }
         if (t.type === "cron") {
@@ -712,7 +743,7 @@ async function init() {
                 <div class="trigger-config-fields">
                     <div><label class="form-hint">起始 HH:MM</label><input type="time" class="form-input" data-field="start" value="${escapeHtml(c.start || "08:00")}"></div>
                     <div><label class="form-hint">结束 HH:MM</label><input type="time" class="form-input" data-field="end" value="${escapeHtml(c.end || "20:00")}"></div>
-                    <div class="full-row"><label class="form-hint">星期（默认全都选中）</label>
+                    <div class="full-row"><label class="form-hint">星期</label>
                         <div class="weekdays-group">
                             ${WEEKDAY_CN.map((d, i) => `<label class="weekday-chip ${wd.includes(i) ? "checked" : ""}"><input type="checkbox" data-weekday="${i}" ${wd.includes(i) ? "checked" : ""}>${d}</label>`).join("")}
                         </div>
@@ -728,9 +759,10 @@ async function init() {
         }
         return `
             <div class="trigger-config-fields">
-                <div><label class="form-hint">小时</label><input type="number" class="form-input" data-field="hours" min="0" value="${parseInt(c.hours) || 0}"></div>
-                <div><label class="form-hint">分钟</label><input type="number" class="form-input" data-field="minutes" min="0" value="${parseInt(c.minutes) || 0}"></div>
-                <div class="full-row"><label class="form-hint">上次任务成功时间：${lastSuccessTime ? fmtTs(lastSuccessTime) : "从未成功执行"}</label></div>
+                <div class="full-row interval-row">
+                    <input type="number" class="form-input" data-field="hours" min="0" value="${parseInt(c.hours) || 0}"><span class="unit">小时</span>
+                    <input type="number" class="form-input" data-field="minutes" min="0" value="${parseInt(c.minutes) || 0}"><span class="unit">分钟</span>
+                </div>
             </div>`;
     }
 
@@ -824,24 +856,20 @@ async function init() {
         fixed: {
             detail: "直接把下方文本作为消息发送到目标，不经过 AI。",
             label: "发送内容",
-            requirement: "输入要求：要发送的固定消息原文。固定文本不支持参数，需要时间信息请改用 AI 模式。",
         },
         standalone: {
             detail: "使用上方「独立 AI 系统提示」+ 下方任务提示词单独调用 AI 生成回复，不携带对话人格、不与其他插件互动。",
             label: "任务提示词",
-            requirement: "输入要求：给 AI 的指令。发送时会统一包裹为 <scheduled_task>…</scheduled_task>，用户提示词不支持参数。",
         },
         conversation: {
             detail: "把下方任务提示词交给目标对话配置的 AI 生成回复，携带该对话的人格 system prompt 与记忆插件注入。",
             label: "任务提示词",
-            requirement: "输入要求：给 AI 的指令。发送时会统一包裹为 <scheduled_task>…</scheduled_task>，用户提示词不支持参数。",
         },
     };
     function updateContentMode() {
         const mode = $("task-mode").value;
         const info = MODE_INFO[mode] || MODE_INFO.fixed;
         $("content-mode-detail").textContent = info.detail;
-        $("content-mode-requirement").textContent = info.requirement;
         $("task-text-label").textContent = info.label;
         // 独立 AI 系统提示仅 standalone 模式使用
         $("system-prompt-group").style.display = mode === "standalone" ? "" : "none";
@@ -879,18 +907,25 @@ async function init() {
         if (!el || !t) return;
         const r = (lastValidate.triggers || []).find(x => x.id === t.id);
         if (r && !r.ok) {
+            el.style.display = "";
             el.textContent = "配置有误：" + r.msg;
             el.className = "trigger-next-fire error";
             return;
         }
-        if (ACTIVE_TYPES.includes(t.type)) {
-            const fires = (r && r.future_fires) || [];
-            el.textContent = fires.length ? "未来触发: " + fires.map(f => fmtTs(f)).join("，") : "未来触发：请完成配置……";
-            el.className = fires.length ? "trigger-next-fire active" : "trigger-next-fire";
-        } else {
-            el.textContent = "被动触发器：无固定触发点，被主动型触发器唤起后实时求值";
-            el.className = "trigger-next-fire";
+        // 区间型/随机型没有可展示的时间信息，整行隐藏
+        if (t.type === "window" || t.type === "random") {
+            el.style.display = "none";
+            return;
         }
+        el.style.display = "";
+        if (t.type === "cooldown") {
+            el.textContent = "上次任务成功时间：" + (lastSuccessTime ? fmtTs(lastSuccessTime) : "从未成功执行");
+            el.className = "trigger-next-fire";
+            return;
+        }
+        const fires = (r && r.future_fires) || [];
+        el.textContent = fires.length ? "未来触发: " + fires.map(f => fmtTs(f)).join("，") : "未来触发：请完成配置……";
+        el.className = fires.length ? "trigger-next-fire active" : "trigger-next-fire";
     }
     function updateCanvasErrors() {
         (lastValidate.triggers || []).forEach(r => {
@@ -980,7 +1015,12 @@ async function init() {
         } catch (e) { showToast("复制失败: " + e.message, true); }
     }
 
-    async function triggerNow(id) {
+    async function triggerNow(id, btn) {
+        // 触发期间禁用按钮并显示加载态，避免连点造成重复触发
+        if (btn) {
+            btn.disabled = true;
+            btn.innerHTML = `<span class="spinner spinner-xs"></span>触发中…`;
+        }
         try {
             const res = await bridge.apiPost("trigger_now", { id });
             if (res && res.status === "success") {
@@ -989,7 +1029,14 @@ async function init() {
             } else {
                 showToast("触发失败: " + (res && res.message || ""), true);
             }
-        } catch (e) { showToast("触发失败: " + e.message, true); }
+        } catch (e) {
+            showToast("触发失败: " + e.message, true);
+        } finally {
+            if (btn && btn.isConnected) {
+                btn.disabled = false;
+                btn.textContent = "触发一次";
+            }
+        }
     }
 
     let pendingDeleteId = null;
