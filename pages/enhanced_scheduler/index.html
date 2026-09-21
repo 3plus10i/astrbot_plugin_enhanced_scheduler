@@ -12,7 +12,7 @@
             <div class="header-left">
                 <span class="back-btn" id="back-btn">← 返回</span>
                 <h1 class="page-title">增强计划任务</h1>
-                <span class="plugin-version">v1.2.0</span>
+                <span class="plugin-version">v1.3.0</span>
             </div>
             <div class="header-right">
                 <div class="tab-nav">
@@ -41,7 +41,6 @@
                                     <th>名称</th>
                                     <th>启用</th>
                                     <th>触发器</th>
-                                    <th>逻辑规则</th>
                                     <th>预计下次触发</th>
                                     <th>内容</th>
                                     <th>发送对象</th>
@@ -49,7 +48,7 @@
                                 </tr>
                             </thead>
                             <tbody id="tasks-body">
-                                <tr><td colspan="8" class="table-empty">暂无计划任务，点击右上角新增。</td></tr>
+                                <tr><td colspan="7" class="table-empty">暂无计划任务，点击右上角新增。</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -72,7 +71,7 @@
                                     <th>时间</th>
                                     <th>任务</th>
                                     <th>触发器结果</th>
-                                    <th>逻辑结果</th>
+                                    <th>条件结果</th>
                                     <th>动作</th>
                                     <th>详情</th>
                                 </tr>
@@ -165,27 +164,36 @@
                         <label class="switch-toggle"><input type="checkbox" id="task-enabled" checked><span class="slider"></span></label>
                     </div>
 
-                    <!-- 触发器组 -->
+                    <!-- 发送对象 -->
+                    <div class="form-group">
+                        <label class="form-label">发送对象</label>
+                        <div class="umo-picker">
+                            <select class="form-input" id="target-select">
+                                <option value="">选择活跃会话…</option>
+                            </select>
+                            <input type="text" class="form-input" id="target-custom" placeholder="或手动输入完整 UMO，回车添加">
+                        </div>
+                        <div class="umo-tags" id="targets-tags"></div>
+                        <span class="form-hint">可添加一个或多个对象，逐个发送并独立记成功/失败。</span>
+                    </div>
+
+                    <!-- 触发器（图形化） -->
                     <div class="section-block">
                         <div class="section-block-header">
                             <div>
-                                <label class="form-label">触发器组</label>
-                                <span class="form-hint">同一事件可绑定多个触发器，下方逻辑规则组合它们。主动型到点触发，被动型被规则引用时实时求值。</span>
+                                <label class="form-label">触发器设置</label>
+                                <span class="form-hint">主动型并排，之间取「或」：任一到点即检查条件；被动型串行，之间取「且」：全部满足才执行。点击节点展开配置。</span>
                             </div>
                         </div>
-                        <div id="triggers-list"></div>
-                        <div class="triggers-add-row">
-                            <button class="btn btn-sm" id="add-trigger-btn" type="button"><span>+ 增加触发器</span></button>
+                        <div class="trigger-canvas-viewport" id="trigger-canvas-viewport">
+                            <div class="trigger-canvas" id="trigger-canvas"></div>
                         </div>
-                    </div>
-
-                    <!-- 逻辑规则 -->
-                    <div class="form-group">
-                        <label class="form-label">逻辑规则表达式</label>
-                        <input type="text" class="form-input" id="task-logic" placeholder="例如：1*2 或 (1+2)*3">
-                        <span class="form-hint">数字=触发器 id；<b>+</b> 表示或；<b>*</b> 表示且；支持括号。优先级 * 高于 +。</span>
-                        <span class="form-hint" id="logic-status" style="color:var(--color-warning);">请先添加触发器</span>
-                        <span class="form-hint" id="next-fire-hint"></span>
+                        <div class="trigger-canvas-actions">
+                            <button class="btn btn-sm" id="add-active-trigger-btn" type="button"><span>+ 新建主动型触发器</span></button>
+                            <button class="btn btn-sm" id="add-passive-trigger-btn" type="button"><span>+ 新建被动型触发器</span></button>
+                            <span class="next-fire-inline" id="next-fire-hint"></span>
+                        </div>
+                        <div class="trigger-panel" id="trigger-panel"></div>
                     </div>
 
                     <!-- 任务内容 -->
@@ -202,29 +210,30 @@
                             </select>
                             <span class="form-hint" id="content-mode-detail"></span>
                         </div>
-                        <div class="form-group">
+                        <div class="form-group" id="system-prompt-group">
                             <label class="form-label">独立 AI 系统提示（仅「调用独立 AI 回复」模式生效，每个任务独立）</label>
                             <textarea class="form-input" id="task-system-prompt"></textarea>
-                            <span class="form-hint">作为该任务独立调用 AI 的 system prompt，不与对话人格、其他插件互动。新建任务预填默认提示，可自行修改；留空则回退默认提示。</span>
+                            <span class="form-hint">作为该任务独立调用 AI 的 system prompt，不与对话人格、其他插件互动。可留空。</span>
                         </div>
                         <div class="form-group">
-                            <label class="form-label">任务内容</label>
-                            <div class="template-vars" id="template-vars"></div>
+                            <label class="form-label" id="task-text-label">任务提示词</label>
                             <textarea class="form-input" id="task-text"></textarea>
+                            <div class="form-group row-align" style="margin:0;">
+                                <div class="form-label-desc">
+                                    <label class="form-label">时间感知</label>
+                                    <span class="form-hint">开启后触发时会把当前时间（年月日 周几 时分秒）附加给 AI（仅两种 AI 模式生效）。</span>
+                                </div>
+                                <label class="switch-toggle"><input type="checkbox" id="task-time-aware" checked><span class="slider"></span></label>
+                            </div>
+                            <div class="form-group row-align" style="margin:0;">
+                                <div class="form-label-desc">
+                                    <label class="form-label">节假日感知</label>
+                                    <span class="form-hint">开启后附加工作日/节假日信息（含调休，需联网查询，仅两种 AI 模式生效）。</span>
+                                </div>
+                                <label class="switch-toggle"><input type="checkbox" id="task-holiday-aware"><span class="slider"></span></label>
+                            </div>
                             <div class="content-mode-requirement" id="content-mode-requirement"></div>
                         </div>
-                    </div>
-
-                    <!-- 发送对象 -->
-                    <div class="section-block">
-                        <div class="section-block-header">
-                            <div>
-                                <label class="form-label">发送对象</label>
-                                <span class="form-hint">从活跃会话下拉选择，也可手动输入完整 UMO。</span>
-                            </div>
-                            <button class="btn btn-secondary btn-sm" id="add-target-btn" type="button"><span>+ 对象</span></button>
-                        </div>
-                        <div id="targets-list"></div>
                     </div>
                 </div>
                 <footer class="modal-footer">

@@ -5,8 +5,7 @@ scheduler_core.py — 增强计划任务插件的核心调度逻辑
   1. 触发器配置校验
   2. 主动触发器的下次触发时间计算与"是否到点"判定
   3. 被动触发器的实时真值（ToF, Trigger-or-False）求值
-  4. 逻辑规则表达式（+ 表示或，* 表示且，支持括号）的解析、校验、求值
-  5. 一次轮询中"合并评估"算法：收集所有到点主动触发器，评估逻辑规则
+  4. 一次轮询中"合并评估"算法：主动型之间取或，被动型之间取且
 
 所有时间戳均为本地时间的 Unix 秒。
 所有函数对非法输入返回安全默认值并尽量给出错误信息。
@@ -15,7 +14,7 @@ scheduler_core.py — 增强计划任务插件的核心调度逻辑
   interval  主动-周期型：从 base_time（基准时间）起，每 days+hours+minutes 累加间隔触发一次
   cron      主动-cron型：标准 5 段 cron 表达式（分 时 日 月 周）
   window    被动-区间型：每天 start~end 且当天星期几在 weekdays 中时为真
-  random    被动-随机型：每次被引用时采样 U(0,1) < threshold 为真
+  random    被动-随机型：每次求值时采样 U(0,1) < threshold 为真
   cooldown  被动-冷却型：now - task_last_success >= 冷却时长 为真
 """
 
@@ -45,8 +44,8 @@ T_WINDOW = "window"
 T_RANDOM = "random"
 T_COOLDOWN = "cooldown"
 
-ACTIVE_TYPES = (T_INTERVAL, T_CRON)      # 主动型：自己到点触发
-PASSIVE_TYPES = (T_WINDOW, T_RANDOM, T_COOLDOWN)  # 被动型：被逻辑规则引用时求值
+ACTIVE_TYPES = (T_INTERVAL, T_CRON)      # 主动型：自己到点触发（多个之间取"或"）
+PASSIVE_TYPES = (T_WINDOW, T_RANDOM, T_COOLDOWN)  # 被动型：被主动型唤起后求值（多个之间取"且"）
 ALL_TYPES = ACTIVE_TYPES + PASSIVE_TYPES
 
 
@@ -381,9 +380,24 @@ def future_fires(trigger: Dict[str, Any], now_ts: float, count: int = 3) -> List
 # ─────────────────────────────────────────────────────────────────────
 
 def passive_tof(trigger: Dict[str, Any], now_ts: float, task_last_success: float) -> bool:
-    """被动触发器实时求值（兼容接口）。对主动触发器返回 False（不应被此函数调用）。"""
-    tof, _ = evaluate_passive_trigger(trigger, now_ts, task_last_success)
-    return tof
+    """被动触发器实时求值。对主动触发器返回 False（不应被此函数调用）。"""
+    ttype = trigger.get("type")
+    cfg = trigger.get("config", {}) or {}
+
+    if ttype == T_WINDOW:
+        return _window_tof(cfg, now_ts)
+    if ttype == T_RANDOM:
+        try:
+            threshold = float(cfg.get("threshold", 0.0))
+        except (TypeError, ValueError):
+            threshold = 0.0
+        return _random.random() < threshold
+    if ttype == T_COOLDOWN:
+        cooldown = int(cfg.get("hours", 0) or 0) * 3600 + int(cfg.get("minutes", 0) or 0) * 60
+        if cooldown <= 0:
+            return True
+        return max(0.0, now_ts - float(task_last_success or 0.0)) >= cooldown
+    return False
 
 
 def _window_tof(cfg: Dict[str, Any], now_ts: float) -> bool:
@@ -418,259 +432,31 @@ def _window_tof(cfg: Dict[str, Any], now_ts: float) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 触发器结果描述（用于任务内容模板变量 {{id}}）
-# 每种触发器类型生成一段人类可读的"结果说明"，替换 {{1}}/{{2}}/... 占位符。
-# 主动型（interval/cron）带触发时间；被动型（window/random/cooldown）实时求值，
-# 采样与真值在同一处完成，保证 tof 与描述一致（尤其是 random）。
-# ─────────────────────────────────────────────────────────────────────
-
-_WEEKDAY_CN = "一二三四五六日"  # 下标 0=周一 … 6=周日，与 Python weekday() 一致
-
-
-def _fmt_short_time(ts: Optional[float]) -> str:
-    """时间戳 -> YYYY-MM-DD HH:MM（精确到分钟，与描述示例一致）。"""
-    if ts is None:
-        return ""
-    try:
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return ""
-
-
-def _fmt_dhms(total_seconds: float) -> str:
-    """秒数 -> 「x天x时x分」；为 0 的高位单位省略，但至少保留最小单位。"""
-    total = max(0, int(total_seconds))
-    d, rem = divmod(total, 86400)
-    h, rem = divmod(rem, 3600)
-    m = rem // 60
-    parts: List[str] = []
-    if d:
-        parts.append(f"{d}天")
-    if h:
-        parts.append(f"{h}时")
-    if m or not parts:
-        parts.append(f"{m}分")
-    return "".join(parts)
-
-
-def describe_active_trigger(trigger: Dict[str, Any], fired_point: Optional[float]) -> str:
-    """主动型（interval/cron）触发器的结果描述。fired_point=None 表示本次未到点。"""
-    ttype = trigger.get("type")
-    cfg = trigger.get("config", {}) or {}
-    prefix = "触发了" if fired_point is not None else "未触发"
-    when = _fmt_short_time(fired_point) if fired_point is not None else ""
-
-    if ttype == T_INTERVAL:
-        d = int(cfg.get("days", 0) or 0)
-        h = int(cfg.get("hours", 0) or 0)
-        m = int(cfg.get("minutes", 0) or 0)
-        dur = _fmt_dhms(d * 86400 + h * 3600 + m * 60)
-        return f"{when}{prefix}周期型触发器（周期{dur}）"
-
-    if ttype == T_CRON:
-        expr = str(cfg.get("expr", ""))
-        return f"{when}{prefix}CRON型触发器（{expr}）"
-
-    return f"{when}{prefix}{ttype}触发器"
-
-
-def evaluate_passive_trigger(trigger: Dict[str, Any], now_ts: float, task_last_success: float) -> Tuple[bool, str]:
-    """被动触发器（window/random/cooldown）的实时求值 + 结果描述。
-    返回 (tof, desc)。采样在内部一次完成，确保 tof 与 desc 一致。"""
-    ttype = trigger.get("type")
-    cfg = trigger.get("config", {}) or {}
-
-    if ttype == T_WINDOW:
-        tof = _window_tof(cfg, now_ts)
-        start = str(cfg.get("start", "00:00"))
-        end = str(cfg.get("end", "23:59"))
-        wds = cfg.get("weekdays") or []
-        if wds:
-            day_str = "每周" + "".join(_WEEKDAY_CN[i] for i in sorted(wds) if 0 <= i <= 6)
-        else:
-            day_str = "每天"
-        scope = f"{day_str}{start}-{end}"
-        return tof, f"{'激活了' if tof else '未激活'}区间触发器：{scope}"
-
-    if ttype == T_RANDOM:
-        try:
-            th = float(cfg.get("threshold", 0.0))
-        except (TypeError, ValueError):
-            th = 0.0
-        sample = _random.random()
-        tof = sample < th
-        return tof, f"{'激活了' if tof else '未激活'}随机触发器：{sample:g}<{th:g}"
-
-    if ttype == T_COOLDOWN:
-        hours = int(cfg.get("hours", 0) or 0)
-        minutes = int(cfg.get("minutes", 0) or 0)
-        cooldown = hours * 3600 + minutes * 60
-        elapsed = max(0.0, now_ts - float(task_last_success or 0.0))
-        tof = (elapsed >= cooldown) if cooldown > 0 else True
-        return tof, f"{'激活了' if tof else '未激活'}冷却触发器：距离上次触发{_fmt_dhms(elapsed)}，大于{_fmt_dhms(cooldown)}"
-
-    return False, f"未知触发器类型：{ttype}"
-
-
-# ─────────────────────────────────────────────────────────────────────
-# 逻辑规则表达式：解析、校验、求值
-# 表达式语法：数字（触发器 id） + 表示或 * 表示且 支持括号
-# 优先级：* 高于 +（类比乘除 vs 加减）
-# ─────────────────────────────────────────────────────────────────────
-
-_TOKEN_RE = re.compile(r"\s*(\d+|[()+*])")
-
-
-def _tokenize(expr: str) -> Optional[List[str]]:
-    """将表达式切分为 token 列表；非法字符返回 None。"""
-    tokens: List[str] = []
-    pos = 0
-    while pos < len(expr):
-        if expr[pos].isspace():
-            pos += 1
-            continue
-        m = _TOKEN_RE.match(expr, pos)
-        if not m or m.start() != pos:
-            return None
-        tokens.append(m.group(1))
-        pos = m.end()
-    return tokens
-
-
-class _Parser:
-    """递归下降解析器，同时用于校验与求值。
-    解析的同时直接求值（传入 tof_map）；校验时传入空 map 并忽略结果。"""
-
-    def __init__(self, tokens: List[str], tof_map: Dict[int, bool], collect_ids: bool = False):
-        self.tokens = tokens
-        self.pos = 0
-        self.tof_map = tof_map
-        self.collect_ids = collect_ids
-        self.ids: set = set()
-
-    def _peek(self) -> Optional[str]:
-        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
-
-    def _next(self) -> Optional[str]:
-        tok = self._peek()
-        if tok is not None:
-            self.pos += 1
-        return tok
-
-    # 所有 parse_* 方法返回 Optional[bool]：None 表示解析失败，否则为该子表达式的真值
-    def parse_term(self):
-        # term := factor ('*' factor)*
-        val = self.parse_factor()
-        if val is None:
-            return None
-        while self._peek() == "*":
-            self._next()
-            rhs = self.parse_factor()
-            if rhs is None:
-                return None
-            val = val and rhs
-        return val
-
-    def parse_expr_v(self):
-        # expr := term ('+' term)*
-        val = self.parse_term()
-        if val is None:
-            return None
-        while self._peek() == "+":
-            self._next()
-            rhs = self.parse_term()
-            if rhs is None:
-                return None
-            val = val or rhs
-        return val
-
-    def parse_factor(self):
-        tok = self._peek()
-        if tok is None:
-            return None
-        if tok == "(":
-            self._next()
-            val = self.parse_expr_v()
-            if val is None:
-                return None
-            if self._peek() != ")":
-                return None
-            self._next()
-            return val
-        if tok.isdigit():
-            self._next()
-            tid = int(tok)
-            if self.collect_ids:
-                self.ids.add(tid)
-            return self.tof_map.get(tid, False)
-        return None
-
-
-def validate_logic_expr(expr: str, valid_ids: List[int]) -> Tuple[bool, str]:
-    """校验逻辑表达式：语法合法 + 所有引用的 id 都存在于 valid_ids。"""
-    if not isinstance(expr, str) or not expr.strip():
-        return False, "逻辑规则不能为空"
-
-    tokens = _tokenize(expr)
-    if tokens is None:
-        return False, "逻辑规则包含非法字符（仅允许数字、+、*、括号）"
-    if not tokens:
-        return False, "逻辑规则不能为空"
-
-    # 先收集引用的 id（用全 False 的 tof_map 跑一遍解析）
-    collector = _Parser(tokens, {}, collect_ids=True)
-    if collector.parse_expr_v() is None or collector.pos != len(tokens):
-        return False, "逻辑规则语法错误（检查括号匹配与运算符位置）"
-
-    referenced = collector.ids
-    valid_set = set(valid_ids)
-    missing = referenced - valid_set
-    if missing:
-        return False, f"逻辑规则引用了不存在的触发器 id: {sorted(missing)}"
-    if not referenced:
-        return False, "逻辑规则必须至少引用一个触发器"
-
-    return True, ""
-
-
-def eval_logic_expr(expr: str, tof_map: Dict[int, bool]) -> bool:
-    """对逻辑表达式求值。表达式应已通过 validate_logic_expr 校验。
-    出于健壮性，任何解析异常都返回 False。"""
-    tokens = _tokenize(expr)
-    if tokens is None:
-        return False
-    parser = _Parser(tokens, tof_map)
-    val = parser.parse_expr_v()
-    if val is None:
-        return False
-    return bool(val)
-
-
-# ─────────────────────────────────────────────────────────────────────
 # 合并评估：一次轮询的核心
 # ─────────────────────────────────────────────────────────────────────
 
 def evaluate_task(triggers: List[Dict[str, Any]],
-                  logic_expr: str,
                   now_ts: float,
                   task_last_success: float) -> Dict[str, Any]:
     """
-    一次轮询中对单个任务进行合并评估。
+    一次轮询中对单个任务进行合并评估。固定语义：
+
+      主动型之间取"或"：任一到点即视为时间条件成立
+      被动型之间取"且"：全部为真时任务才执行
+      主动与被动之间取"且"：即"（任一主动到点）且（所有被动为真）"
 
     流程：
-      1. 对每个主动触发器调用 check_active_fire，收集到点的主动触发器及其触发点
-      2. 若无任何主动触发器到点，返回不触发（无需评估被动触发器）
-      3. 构造 tof_map：到点的主动触发器=True，未到点的主动触发器=False，被动触发器实时求值
-      4. eval_logic_expr 求逻辑结果
-      5. 返回结构化结果（含各触发器 ToF、逻辑结果、需更新的 last_fired）
+      1. 校验触发器；非法则直接返回不触发
+      2. 收集到点的主动触发器（无主动触发器或有主动但均未到点 → 不触发）
+      3. 实时求值所有被动触发器
+      4. should_run = 至少一个主动到点 and 所有被动为真
 
     返回 dict:
       {
-        "should_run": bool,                 # 逻辑规则是否通过（是否应执行任务）
+        "should_run": bool,                 # 是否应执行任务
         "has_active_fire": bool,            # 是否有主动触发器到点
         "trigger_tof": {id: bool, ...},     # 各触发器本次评估的 ToF（用于日志）
         "fired_points": {id: float, ...},   # 到点主动触发器的触发点时间戳（用于更新 last_fired）
-        "trigger_desc": {id: str, ...},     # 各触发器本次评估的结果描述（用于模板变量 {{id}}）
       }
     """
     result = {
@@ -678,66 +464,49 @@ def evaluate_task(triggers: List[Dict[str, Any]],
         "has_active_fire": False,
         "trigger_tof": {},
         "fired_points": {},
-        "trigger_desc": {},
     }
 
-    # 先校验触发器与逻辑表达式；非法则直接返回（不触发）
-    valid_ids = []
-    id_to_trigger: Dict[int, Dict[str, Any]] = {}
+    # 先校验触发器；非法则直接返回（不触发）
     for tg in triggers:
-        ok, _ = validate_trigger(tg)
-        if not ok:
+        if not validate_trigger(tg)[0]:
             return result
-        tid = tg.get("id")
-        valid_ids.append(tid)
-        id_to_trigger[tid] = tg
 
-    ok, _ = validate_logic_expr(logic_expr, valid_ids)
-    if not ok:
-        return result
-
-    # 收集到点的主动触发器
+    # 收集到点的主动触发器（或关系）
     fired_points: Dict[int, float] = {}
     for tg in triggers:
         if tg.get("type") not in ACTIVE_TYPES:
             continue
-        fired, fp = check_active_fire(tg, now_ts)
+        fired, fire_point = check_active_fire(tg, now_ts)
         if fired:
-            fired_points[tg["id"]] = fp
+            fired_points[tg["id"]] = fire_point
 
     if not fired_points:
-        # 没有主动触发器到点，不触发；但仍记录各触发器 ToF 供调用方决定是否写日志
-        # （通常无主动到点时不写日志，由调用方判断）
+        # 没有主动触发器到点，不触发；记录主动型 ToF 供调用方判断是否写日志
         result["trigger_tof"] = {tg["id"]: False for tg in triggers if tg.get("type") in ACTIVE_TYPES}
         return result
 
     result["has_active_fire"] = True
     result["fired_points"] = fired_points
 
-    # 构造 tof_map 与 desc_map：主动型按"是否到点"取真值并生成带时间的描述，
-    # 被动型实时求值（采样与描述在同一处完成，保证一致）
+    # 构造 tof_map：主动型按"是否到点"取真值，被动型实时求值
     tof_map: Dict[int, bool] = {}
-    desc_map: Dict[int, str] = {}
+    passives_ok = True
     for tg in triggers:
         tid = tg["id"]
-        ttype = tg.get("type")
-        if ttype in ACTIVE_TYPES:
-            fp = fired_points.get(tid)
-            tof_map[tid] = fp is not None
-            desc_map[tid] = describe_active_trigger(tg, fp)
+        if tg.get("type") in ACTIVE_TYPES:
+            tof_map[tid] = fired_points.get(tid) is not None
         else:
-            tof, desc = evaluate_passive_trigger(tg, now_ts, task_last_success)
+            tof = passive_tof(tg, now_ts, task_last_success)
             tof_map[tid] = tof
-            desc_map[tid] = desc
+            passives_ok = passives_ok and tof
 
     result["trigger_tof"] = tof_map
-    result["trigger_desc"] = desc_map
-    result["should_run"] = eval_logic_expr(logic_expr, tof_map)
+    result["should_run"] = passives_ok
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 动态参数模板渲染
+# 提示词模板渲染（仅用于标准化的 <scheduled_task> 包裹模板）
 # ─────────────────────────────────────────────────────────────────────
 
 _PARAM_RE = re.compile(r"\{\{\s*([\w.]+)\s*\}\}")
@@ -745,13 +514,11 @@ _PARAM_RE = re.compile(r"\{\{\s*([\w.]+)\s*\}\}")
 
 def render_template(text: str, params: Dict[str, Any], now_ts: float) -> str:
     """
-    将 {{key}} 形式的占位符替换为 params[key]。
-    内置参数（params 中由调用方预先注入）：
-      time      -> YYYY-MM-DD HH:MM:SS
-      date      -> YYYY-MM-DD
-      weekday   -> 周一/周二...
-    触发器结果变量由调用方以字符串 id 作为 key 注入 params（如 {"1": "触发了周期型触发器…"}），
-    对应 {{1}}/{{2}}/... 占位符。
+    将 {{key}} 形式的占位符替换为 params[key]，供固定包裹模板使用。
+    内置参数：
+      time -> YYYY年MM月DD日 星期X HH:MM:SS（含年月日、周几、时分秒）
+    调用方通过 params 传入 {{task_prompt}}（任务提示词）与 {{holiday_clause}}（节假日子句）。
+    替换值不再二次扫描，因此用户提示词中若出现 {{...}} 会被原样保留（用户提示词已不支持参数）。
     若 text 不是字符串则原样返回。
     """
     if not isinstance(text, str):
@@ -760,9 +527,7 @@ def render_template(text: str, params: Dict[str, Any], now_ts: float) -> str:
     # 注入内置参数（不覆盖调用方传入的同名参数）
     now = _dt(now_ts)
     builtin = {
-        "time": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "date": now.strftime("%Y-%m-%d"),
-        "weekday": "周" + "一二三四五六日"[now.weekday()],
+        "time": now.strftime("%Y年%m月%d日 ") + "星期" + "一二三四五六日"[now.weekday()] + now.strftime(" %H:%M:%S"),
     }
     merged = dict(builtin)
     if isinstance(params, dict):

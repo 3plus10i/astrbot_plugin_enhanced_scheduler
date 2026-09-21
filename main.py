@@ -11,6 +11,7 @@ import uuid
 import base64
 import hashlib
 import asyncio
+import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 from astrbot.api import logger
@@ -44,15 +45,28 @@ LLM_REC_DIR_NAME = "rec"
 LLM_IMG_DIR_NAME = "img"
 LEGACY_LLM_LOG_FILE_NAME = "llm_calls.jsonl"
 
-# 「独立 AI 回复」模式的默认 system prompt（每个任务可覆盖，新建任务预填此值）
-DEFAULT_STANDALONE_SYSTEM_PROMPT = "<proactive_trigger>这是由计划任务自动触发的一次会话，现在时间是 {{time}}。请根据用户的指令进行回复。你的回复将被直接发送给用户。</proactive_trigger>";
+# 标准化的任务提示词包裹模板（两种 AI 模式共用）
+#   {{time}}            -> YYYY年MM月DD日 星期X HH:MM:SS
+#   {{holiday_clause}}  -> "" 或 "，今天是…"（节假日感知开关开启时）
+#   {{task_prompt}}     -> 用户填写的任务提示词
+SCHEDULED_PROMPT_WITH_TIME = "<scheduled_task>这是由计划任务自动触发的一次会话，现在时间是 {{time}}{{holiday_clause}}。请根据以下指令进行回复。你的回复将被直接发送给用户。{{task_prompt}}</scheduled_task>"
+SCHEDULED_PROMPT_NO_TIME = "<scheduled_task>这是由计划任务自动触发的一次会话{{holiday_clause}}。请根据以下指令进行回复。你的回复将被直接发送给用户。{{task_prompt}}</scheduled_task>"
+
+# 工作日/节假日查询接口（timor.tech），按日期查询，返回 JSON
+# 用 https：http 会被 302 到 https，多一次握手且实测更慢/更易超时
+# 该接口对空 User-Agent 返回 403，必须带上浏览器风格 UA
+HOLIDAY_API_URL = "https://timor.tech/api/holiday/info/"
+HOLIDAY_API_UA = "Mozilla/5.0"
+
+# 旧版默认「独立 AI 系统提示」；该包裹文本已迁到任务提示词外层，迁移时与之一致的旧值清空
+LEGACY_STANDALONE_SYSTEM_PROMPT = "<proactive_trigger>这是由计划任务自动触发的一次会话，现在时间是 {{time}}。请根据用户的指令进行回复。你的回复将被直接发送给用户。</proactive_trigger>"
 
 
 @register(
     PLUGIN_NAME,
     "3plus10i",
-    "未来任务调度器，支持多触发器组合与逻辑规则。",
-    "1.2.0",
+    "未来任务调度器，主动取或、被动取且的多触发器组合。",
+    "1.3.0",
 )
 class EnhancedSchedulerPlugin(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):
@@ -76,6 +90,9 @@ class EnhancedSchedulerPlugin(Star):
 
         # 并发安全锁
         self._lock = asyncio.Lock()
+
+        # 节假日信息缓存（日期字符串 -> 「今天是…」子句，一天一次查询）
+        self._holiday_cache: Dict[str, str] = {}
 
         # 运行期数据
         self.data: Dict[str, Any] = {"tasks": {}, "logs": []}
@@ -146,12 +163,50 @@ class EnhancedSchedulerPlugin(Star):
         except (TypeError, ValueError):
             return 10
 
-    def _standalone_prompt(self, content: dict) -> str:
-        """解析独立 AI 模式的 system prompt（任务级，空则回退默认）。"""
+    def _wrap_scheduled_prompt(self, task_prompt: str, time_aware: bool, holiday_clause: str, now: float) -> str:
+        """把任务提示词包进标准化的 <scheduled_task> 外层（两种 AI 模式共用）。"""
+        tpl = SCHEDULED_PROMPT_WITH_TIME if time_aware else SCHEDULED_PROMPT_NO_TIME
+        return core.render_template(
+            tpl,
+            {"task_prompt": task_prompt, "holiday_clause": holiday_clause},
+            now,
+        )
+
+    def _standalone_system_prompt(self, content: dict) -> str:
+        """独立 AI 模式的系统提示（任务级文本，不做参数渲染）。"""
         raw = content.get("system_prompt", "") if isinstance(content, dict) else ""
-        if isinstance(raw, str) and raw.strip():
-            return core.render_template(raw, {}, time.time())
-        return DEFAULT_STANDALONE_SYSTEM_PROMPT
+        return raw.strip() if isinstance(raw, str) else ""
+
+    async def _holiday_clause(self, now: float) -> str:
+        """取「，今天是…」子句（工作日/周末/节日/调休）。查询失败返回空串，不影响发送。"""
+        date_str = time.strftime("%Y-%m-%d", time.localtime(now))
+        cached = self._holiday_cache.get(date_str)
+        if cached is not None:
+            return cached
+        try:
+            data = await asyncio.to_thread(self._fetch_holiday_io, date_str)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[EnhancedScheduler] 查询节假日信息异常: {e}")
+            return ""
+        desc = _format_holiday_desc(data)
+        if not desc:
+            return ""
+        clause = "，" + desc
+        self._holiday_cache[date_str] = clause
+        return clause
+
+    def _fetch_holiday_io(self, date_str: str) -> Optional[dict]:
+        """线程内查询节假日接口；失败返回 None。"""
+        try:
+            req = urllib.request.Request(
+                f"{HOLIDAY_API_URL}{date_str}",
+                headers={"User-Agent": HOLIDAY_API_UA},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[EnhancedScheduler] 获取节假日信息失败 {date_str}: {e}")
+            return None
 
     # ─────────────────────────────────────────────────────────────
     # 持久化
@@ -168,14 +223,24 @@ class EnhancedSchedulerPlugin(Star):
                 logger.error(f"[EnhancedScheduler] 读取数据失败，使用空数据: {e}")
         self.data.setdefault("tasks", {})
         self.data.setdefault("logs", [])
-        # 数据迁移：旧版 use_llm(bool) -> mode(fixed/standalone/conversation)
+        # 数据迁移：
+        #   use_llm(bool) -> mode(fixed/standalone/conversation)
+        #   取消逻辑组合 -> 删除 logic_expr（改由"主动或/被动且"固定语义）
+        #   新增内容开关 time_aware；旧版默认独立 AI 系统提示（包裹文本）清空
         for task in self.data.get("tasks", {}).values():
             if not isinstance(task, dict):
                 continue
+            task.pop("logic_expr", None)
             content = task.get("content")
             if isinstance(content, dict):
                 content["mode"] = _resolve_mode(content)
                 content.pop("use_llm", None)
+                if not isinstance(content.get("time_aware"), bool):
+                    content["time_aware"] = True
+                if not isinstance(content.get("holiday_aware"), bool):
+                    content["holiday_aware"] = False
+                if content.get("system_prompt") == LEGACY_STANDALONE_SYSTEM_PROMPT:
+                    content["system_prompt"] = ""
         # 数据迁移：旧版 interval 触发器无 base_time -> 补为创建日 0 点
         for task in self.data.get("tasks", {}).values():
             if not isinstance(task, dict):
@@ -255,15 +320,14 @@ class EnhancedSchedulerPlugin(Star):
                 continue
 
             triggers = task.get("triggers", [])
-            logic_expr = task.get("logic_expr", "")
             last_success = float(task.get("last_success_time", 0.0) or 0.0)
 
-            res = core.evaluate_task(triggers, logic_expr, now, last_success)
+            res = core.evaluate_task(triggers, now, last_success)
 
             if not res["has_active_fire"]:
                 continue
 
-            # 更新到点主动触发器的 last_fired（无论逻辑是否通过，到点即推进，避免重复判定）
+            # 更新到点主动触发器的 last_fired（无论被动条件是否通过，到点即推进，避免重复判定）
             fired_points = res.get("fired_points", {})
             if fired_points:
                 for tg in triggers:
@@ -277,7 +341,7 @@ class EnhancedSchedulerPlugin(Star):
             tof_snapshot = dict(res.get("trigger_tof", {}))
 
             if not should_run:
-                # 逻辑未通过：未执行动作，视为 skip，不推进冷却计时器
+                # 被动条件未全部满足：未执行动作，视为 skip，不推进冷却计时器
                 self._append_log({
                     "time": now,
                     "task_id": task_id,
@@ -286,16 +350,16 @@ class EnhancedSchedulerPlugin(Star):
                     "logic_result": False,
                     "action": "skipped",
                     "targets_result": [],
-                    "detail": "跳过（逻辑规则未通过，未执行动作）",
+                    "detail": "跳过（被动触发器条件未全部满足，未执行动作）",
                 })
                 changed = True
                 continue
 
             # 执行任务；success 表示"成功执行了动作"（含空动作视为成功）
-            action, targets_result, detail, success = await self._execute_task(task, now, res.get("trigger_desc"))
+            action, targets_result, detail, success = await self._execute_task(task, now)
 
             # 只有成功执行才更新 last_success_time（冷却型依赖此）；
-            # skip（逻辑未通过）与发送失败都不推进冷却
+            # skip（被动条件未满足）与发送失败都不推进冷却
             if success:
                 task["last_success_time"] = now
                 changed = True
@@ -319,15 +383,13 @@ class EnhancedSchedulerPlugin(Star):
     # 任务执行
     # ─────────────────────────────────────────────────────────────
 
-    async def _execute_task(self, task: dict, now: float, trigger_desc: Optional[dict] = None, source: str = "scheduled"):
+    async def _execute_task(self, task: dict, now: float, source: str = "scheduled"):
         """
         执行任务内容并发送。返回 (action, targets_result, detail, success)。
         action: "send_fixed" | "send_llm" | "noop" | "partial" | "failed"
         targets_result: [{"umo":..., "ok":bool, "error":str}, ...]
         success: 是否"成功执行了动作"——空动作(内容留空)视为成功；发送时**所有目标都成功**才为 True，
                  任一部分失败即视为失败（不静默降级为直接发送）。
-        trigger_desc: {id: str} 各触发器结果描述（用于模板变量 {{id}}）；
-                      自动触发由 evaluate_task 提供，手动触发时缺省则由本方法兜底生成。
         source: "scheduled"（自动）或 "manual"（手动触发），用于 LLM 日志标注。
         """
         content = task.get("content", {})
@@ -348,11 +410,16 @@ class EnhancedSchedulerPlugin(Star):
         if not targets:
             return "noop", [], "无发送对象，跳过", False
 
-        # 触发器结果描述（{{id}} 模板变量）：自动触发由 evaluate_task 提供；手动触发兜底生成
-        if trigger_desc is None:
-            trigger_desc = self._describe_triggers(task, now)
-        render_params = {str(k): v for k, v in trigger_desc.items()}
-        rendered = core.render_template(text, render_params, now)
+        # 固定文本：直接发送原文；两种 AI 模式：任务提示词统一包裹为标准 <scheduled_task> 文本
+        if mode == "fixed":
+            prompt_text = text
+        else:
+            holiday_clause = ""
+            if bool(content.get("holiday_aware", False)):
+                holiday_clause = await self._holiday_clause(now)
+            prompt_text = self._wrap_scheduled_prompt(
+                text, bool(content.get("time_aware", True)), holiday_clause, now
+            )
 
         # 独立 AI：所有目标共享一次生成结果（不依赖会话人格）；
         # chat_provider_id 从第一个目标 UMO 的会话配置获取。
@@ -361,7 +428,7 @@ class EnhancedSchedulerPlugin(Star):
         if mode == "standalone":
             first_umo = str(targets[0]).strip()
             standalone_text, standalone_error = await self._llm_generate_standalone(
-                first_umo, rendered, self._standalone_prompt(content), log_ctx
+                first_umo, prompt_text, self._standalone_system_prompt(content), log_ctx
             )
 
         targets_result: List[Dict[str, Any]] = []
@@ -374,13 +441,13 @@ class EnhancedSchedulerPlugin(Star):
             try:
                 conv_cid = None
                 if mode == "fixed":
-                    msg_text = rendered
+                    msg_text = prompt_text
                 elif mode == "standalone":
                     if standalone_error:
                         raise RuntimeError(standalone_error)
                     msg_text = standalone_text
                 else:  # conversation
-                    msg_text, gen_err, conv_cid = await self._llm_generate_for_target(umo_str, rendered, log_ctx)
+                    msg_text, gen_err, conv_cid = await self._llm_generate_for_target(umo_str, prompt_text, log_ctx)
                     if gen_err:
                         raise RuntimeError(gen_err)
 
@@ -414,24 +481,6 @@ class EnhancedSchedulerPlugin(Star):
             detail = f"部分失败（{ok_count}/{total} 成功）: " + "; ".join(errors)
             return "partial", targets_result, detail, False
         return "failed", targets_result, "全部失败: " + "; ".join(errors), False
-
-    def _describe_triggers(self, task: dict, now: float) -> Dict[str, str]:
-        """生成任务内每个触发器的结果描述（手动触发等未经过 evaluate_task 的场景兜底）。
-        主动型视为未到点（手动触发绕过触发规则），被动型按当前时刻实时求值。返回 {str(id): desc}。"""
-        desc: Dict[str, str] = {}
-        last_success = float(task.get("last_success_time", 0.0) or 0.0)
-        for tg in task.get("triggers", []):
-            if not isinstance(tg, dict):
-                continue
-            tid = tg.get("id")
-            if not isinstance(tid, int):
-                continue
-            if tg.get("type") in core.ACTIVE_TYPES:
-                desc[str(tid)] = core.describe_active_trigger(tg, None)
-            else:
-                _, d = core.evaluate_passive_trigger(tg, now, last_success)
-                desc[str(tid)] = d
-        return desc
 
     async def _llm_generate_for_target(self, umo: str, user_prompt: str, log_ctx: Optional[dict] = None) -> tuple:
         """
@@ -971,7 +1020,7 @@ class EnhancedSchedulerPlugin(Star):
         self.context.register_web_api(f"{prefix}/upsert_task", self._api_upsert_task, ["POST"], "新增/更新任务")
         self.context.register_web_api(f"{prefix}/delete_task", self._api_delete_task, ["POST"], "删除任务")
         self.context.register_web_api(f"{prefix}/copy_task", self._api_copy_task, ["POST"], "复制任务")
-        self.context.register_web_api(f"{prefix}/validate", self._api_validate, ["POST"], "校验触发器与逻辑规则")
+        self.context.register_web_api(f"{prefix}/validate", self._api_validate, ["POST"], "校验触发器并预览未来触发时间")
         self.context.register_web_api(f"{prefix}/preview_next", self._api_preview_next, ["POST"], "预览下次触发时间")
         self.context.register_web_api(f"{prefix}/trigger_now", self._api_trigger_now, ["POST"], "立即手动触发一次任务")
         self.context.register_web_api(f"{prefix}/get_llm_logs", self._api_get_llm_logs, ["GET"], "分页获取 LLM 调用日志元数据")
@@ -998,7 +1047,6 @@ class EnhancedSchedulerPlugin(Star):
             tasks_out[tid] = t_copy
         resp["tasks"] = tasks_out
         resp["logs"] = list(self.data.get("logs", []))
-        resp["default_standalone_prompt"] = DEFAULT_STANDALONE_SYSTEM_PROMPT
         return jsonify(resp)
 
     async def _api_save_config(self):
@@ -1116,10 +1164,9 @@ class EnhancedSchedulerPlugin(Star):
                 return False, f"触发器 {tid}: {msg}", ""
             norm_triggers.append(norm_tg)
 
-        logic_expr = str(req.get("logic_expr", "")).strip()
-        ok, msg = core.validate_logic_expr(logic_expr, [t["id"] for t in norm_triggers])
-        if not ok:
-            return False, f"逻辑规则: {msg}", ""
+        # 固定语义：主动型之间取或、被动型之间取且 —— 没有主动触发器则永远不会触发
+        if not any(t["type"] in core.ACTIVE_TYPES for t in norm_triggers):
+            return False, "至少需要一个主动型触发器（周期型或 cron 型）", ""
 
         content = req.get("content", {})
         if not isinstance(content, dict):
@@ -1127,6 +1174,8 @@ class EnhancedSchedulerPlugin(Star):
         text = str(content.get("text", "") or "")
         mode = _resolve_mode(content)
         system_prompt = str(content.get("system_prompt", "") or "")
+        time_aware = bool(content.get("time_aware", True))
+        holiday_aware = bool(content.get("holiday_aware", False))
 
         targets = req.get("targets", [])
         if not isinstance(targets, list):
@@ -1143,8 +1192,13 @@ class EnhancedSchedulerPlugin(Star):
             task["name"] = name
             task["enabled"] = enabled
             task["triggers"] = norm_triggers
-            task["logic_expr"] = logic_expr
-            task["content"] = {"text": text, "mode": mode, "system_prompt": system_prompt}
+            task["content"] = {
+                "text": text,
+                "mode": mode,
+                "system_prompt": system_prompt,
+                "time_aware": time_aware,
+                "holiday_aware": holiday_aware,
+            }
             task["targets"] = targets
             task["updated_at"] = now
             return True, "", task_id
@@ -1155,8 +1209,13 @@ class EnhancedSchedulerPlugin(Star):
                 "name": name,
                 "enabled": enabled,
                 "triggers": norm_triggers,
-                "logic_expr": logic_expr,
-                "content": {"text": text, "mode": mode, "system_prompt": system_prompt},
+                "content": {
+                    "text": text,
+                    "mode": mode,
+                    "system_prompt": system_prompt,
+                    "time_aware": time_aware,
+                    "holiday_aware": holiday_aware,
+                },
                 "targets": targets,
                 "last_success_time": 0.0,
                 "created_at": now,
@@ -1209,7 +1268,6 @@ class EnhancedSchedulerPlugin(Star):
                     }
                     for t in src.get("triggers", [])
                 ],
-                "logic_expr": src.get("logic_expr", ""),
                 "content": json.loads(json.dumps(src.get("content", {}))),
                 "targets": list(src.get("targets", [])),
                 "last_success_time": 0.0,
@@ -1224,33 +1282,25 @@ class EnhancedSchedulerPlugin(Star):
             return jsonify({"status": "error", "message": str(e)}), 500
 
     async def _api_validate(self):
-        """校验触发器组与逻辑规则，供前端实时校验。"""
+        """校验触发器并预览未来触发时间，供前端实时校验。"""
         from quart import request, jsonify
         try:
             req = await request.json
             if not isinstance(req, dict):
                 return jsonify({"status": "error", "message": "请求体必须是 JSON 对象"}), 400
-            results = {"triggers": [], "logic": None, "next_fire": None}
+            results: Dict[str, Any] = {"triggers": [], "has_active": False, "next_fire": None}
 
             triggers = req.get("triggers", []) or []
             now = time.time()
-            valid_ids = []
             for tg in triggers:
                 ok, msg = core.validate_trigger(tg)
                 entry = {"id": tg.get("id"), "ok": ok, "msg": msg, "future_fires": None}
                 if ok:
-                    valid_ids.append(tg.get("id"))
                     if tg.get("type") in core.ACTIVE_TYPES:
+                        results["has_active"] = True
                         # 以当前时刻为起点预览该触发器的未来 3 个触发点（与 last_fired 无关）
                         entry["future_fires"] = core.future_fires(tg, now, 3)
                 results["triggers"].append(entry)
-
-            logic_expr = str(req.get("logic_expr", "") or "")
-            if logic_expr:
-                ok, msg = core.validate_logic_expr(logic_expr, valid_ids)
-                results["logic"] = {"ok": ok, "msg": msg}
-            else:
-                results["logic"] = {"ok": False, "msg": "逻辑规则为空"}
 
             # 下次检查触发时间（触发器组级别，仅主动触发器）
             results["next_fire"] = core.next_trigger_preview(triggers, now)
@@ -1387,6 +1437,33 @@ def _resolve_mode(content) -> str:
     if content.get("use_llm"):
         return MODE_CONVERSATION
     return MODE_FIXED
+
+
+def _format_holiday_desc(data) -> str:
+    """把 timor.tech 节假日接口的返回转成一句「今天是…」；无法判断时返回空串。
+
+    取值规则：
+      holiday 为 null 且 type.type == 0（工作日）      -> 今天是工作日
+      holiday 为 null 且 type.type == 1（周末）        -> 今天是周六（用 type.name）
+      holiday.holiday == false（调休上班）             -> 今天是工作日，是“国庆前调休”
+      holiday.holiday == true（放假）                  -> 今天是“中秋节”假期
+    """
+    if not isinstance(data, dict) or data.get("code") != 0:
+        return ""
+    holiday = data.get("holiday")
+    if isinstance(holiday, dict):
+        name = str(holiday.get("name") or "").strip()
+        if not name:
+            return ""
+        return f"今天是“{name}”假期" if holiday.get("holiday") else f"今天是工作日，是“{name}”"
+    ttype = data.get("type")
+    if isinstance(ttype, dict):
+        if ttype.get("type") == 0:
+            return "今天是工作日"
+        name = str(ttype.get("name") or "").strip()
+        if name:
+            return f"今天是{name}"
+    return ""
 
 
 def _json_safe(obj):

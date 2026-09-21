@@ -7,7 +7,6 @@ async function init() {
     let allLogs = [];
     let sessionsList = [];
     let validateTimer = null;
-    let defaultPrompt = "";
 
     // ── 工具函数 ──
     function $(id) { return document.getElementById(id); }
@@ -39,8 +38,6 @@ async function init() {
             return m;
         });
     }
-    // JS getDay: 0=周日..6=周六 -> Python weekday: 0=周一..6=周日
-    function pyWeekday(d) { return (d.getDay() + 6) % 7; }
     // 当前自然日 0 点，格式化为 datetime-local 所需 YYYY-MM-DDTHH:MM
     function defaultBaseTime() {
         const d = new Date();
@@ -78,7 +75,6 @@ async function init() {
             if (!res || res.status !== "success") { showToast("获取数据失败", true); return; }
             allTasks = res.tasks || {};
             allLogs = res.logs || [];
-            defaultPrompt = res.default_standalone_prompt || "";
             renderTasks();
             renderLogs();
             renderConfig(res.config || {});
@@ -102,10 +98,10 @@ async function init() {
         }
         body.innerHTML = keys.map(k => {
             const t = allTasks[k];
-            const trigSummary = (t.triggers || []).map(tr => {
-                const cn = {interval:"周期",cron:"cron",window:"区间",random:"随机",cooldown:"冷却"}[tr.type] || tr.type;
-                return `<span class="badge badge-fixed">#${tr.id} ${cn}</span> `;
-            }).join(" ");
+            const trgList = t.triggers || [];
+            const activeCount = trgList.filter(tr => tr.type === "interval" || tr.type === "cron").length;
+            const passiveCount = trgList.length - activeCount;
+            const trigSummary = `<span class="badge badge-llm">${activeCount} 主动</span> <span class="badge badge-fixed">${passiveCount} 被动</span>`;
             const ct = t.content || {};
             const mode = ct.mode || (ct.use_llm ? "conversation" : "fixed");
             const hasText = !!(ct.text && String(ct.text).trim());
@@ -119,7 +115,6 @@ async function init() {
                     <td class="cell-wrap"><strong>${escapeHtml(t.name)}</strong></td>
                     <td><span class="badge ${t.enabled ? 'badge-active' : 'badge-inactive'}">${t.enabled ? '启用' : '停用'}</span></td>
                     <td class="cell-wrap">${trigSummary || '—'}</td>
-                    <td><code>${escapeHtml(t.logic_expr)}</code></td>
                     <td>${nf ? fmtTs(nf) : '—'}</td>
                     <td>${contentBadge}</td>
                     <td>${(t.targets || []).length} 个</td>
@@ -458,8 +453,33 @@ async function init() {
 
     // ── 任务编辑弹窗 ──
     const modal = $("task-modal");
+    const ACTIVE_TYPES = ["interval", "cron"];
+    const PASSIVE_TYPES = ["window", "random", "cooldown"];
+    const TYPE_INFO = {
+        interval: { kind: "active", label: "主动-周期型", desc: "从基准时间开始，每经过周期触发一次" },
+        cron: { kind: "active", label: "主动-cron型", desc: "按标准 5 段 cron 表达式（分 时 日 月 周）触发" },
+        window: { kind: "passive", label: "被动-区间型", desc: "被主动型触发器唤起后，若在指定时间段内则触发" },
+        random: { kind: "passive", label: "被动-随机型", desc: "被主动型触发器唤起后，以给定概率触发" },
+        cooldown: { kind: "passive", label: "被动-冷却型", desc: "被主动型触发器唤起后，若距上次成功超过冷却时长则触发" },
+    };
+    const WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+
+    let triggers = [];            // [{id, type, config}]
+    let targets = [];             // [umo]
+    let selectedTriggerId = null;
+    let nextTriggerId = 1;
+    let lastValidate = { triggers: [], has_active: false, next_fire: null };
+    let lastSuccessTime = 0;
+
     function openModal() { modal.classList.add("active"); }
-    function closeModal() { modal.classList.remove("active"); $("task-form").reset(); $("triggers-list").innerHTML = ""; $("targets-list").innerHTML = ""; }
+    function closeModal() {
+        modal.classList.remove("active");
+        $("task-form").reset();
+        triggers = []; targets = []; selectedTriggerId = null;
+        $("trigger-canvas").innerHTML = "";
+        $("trigger-panel").innerHTML = "";
+        $("targets-tags").innerHTML = "";
+    }
     $("modal-close-btn").addEventListener("click", closeModal);
     $("modal-cancel-btn").addEventListener("click", closeModal);
     // 表单内容太多，点击遮罩层关闭容易误操作，暂时禁用
@@ -468,243 +488,353 @@ async function init() {
     $("add-task-btn").addEventListener("click", () => openTaskModal("add", null));
 
     function openTaskModal(action, id) {
+        const task = (action === "edit" && allTasks[id]) ? allTasks[id] : null;
         $("task-action").value = action;
         $("task-id").value = id || "";
-        $("triggers-list").innerHTML = "";
-        $("targets-list").innerHTML = "";
-        $("task-logic").value = "";
         $("task-text").value = "";
+        $("task-system-prompt").value = "";
+        $("trigger-panel").innerHTML = "";
+        lastValidate = { triggers: [], has_active: false, next_fire: null };
+        lastSuccessTime = task ? Number(task.last_success_time || 0) : 0;
 
-        if (action === "edit" && allTasks[id]) {
-            const t = allTasks[id];
-            $("modal-title-text").textContent = "编辑: " + t.name;
-            $("task-name").value = t.name || "";
-            $("task-enabled").checked = t.enabled !== false;
-            $("task-logic").value = t.logic_expr || "";
-            const m = (t.content && t.content.mode) || ((t.content && t.content.use_llm) ? "conversation" : "fixed");
-            $("task-mode").value = m;
-            $("task-text").value = (t.content && t.content.text) || "";
-            $("task-system-prompt").value = (t.content && t.content.system_prompt) || defaultPrompt;
-            (t.triggers || []).forEach(tr => addTriggerRow(tr));
-            (t.targets || []).forEach(tg => addTargetRow(tg));
+        if (task) {
+            $("modal-title-text").textContent = "编辑: " + task.name;
+            $("task-name").value = task.name || "";
+            $("task-enabled").checked = task.enabled !== false;
+            const c = task.content || {};
+            $("task-mode").value = c.mode || (c.use_llm ? "conversation" : "fixed");
+            $("task-text").value = c.text || "";
+            $("task-system-prompt").value = c.system_prompt || "";
+            $("task-time-aware").checked = c.time_aware !== false;
+            $("task-holiday-aware").checked = c.holiday_aware === true;
+            triggers = (task.triggers || []).map(tr => ({
+                id: tr.id,
+                type: tr.type,
+                config: JSON.parse(JSON.stringify(tr.config || {})),
+            }));
+            targets = (task.targets || []).slice();
         } else {
             $("modal-title-text").textContent = "新增计划任务";
+            $("task-name").value = "";
             $("task-enabled").checked = true;
             $("task-mode").value = "fixed";
-            $("task-system-prompt").value = defaultPrompt;
-            const firstId = addTriggerRow(null);
-            $("task-logic").value = String(firstId);
-            addTargetRow("");
+            $("task-time-aware").checked = true;
+            $("task-holiday-aware").checked = false;
+            triggers = [{ id: 1, type: "interval", config: defaultConfigFor("interval") }];
+            targets = [];
         }
+        nextTriggerId = triggers.reduce((max, t) => Math.max(max, t.id), 0) + 1;
+        selectedTriggerId = triggers.length ? triggers[0].id : null;
+
+        renderTargetPicker();
+        renderTargets();
+        renderTriggerCanvas();
+        renderTriggerPanel();
         updateContentMode();
-        renderTemplateVars();
+        updateValidateHints();
         scheduleValidate();
         openModal();
     }
 
-    // ── 触发器组管理 ──
-    const TYPE_LABELS = {
-        interval: { label: "主动-周期型", desc: "从基准时间起，按固定周期累加触发；主动到点。" },
-        cron: { label: "主动-cron型", desc: "按标准 5 段 cron 表达式（分 时 日 月 周）触发；主动到点。" },
-        window: { label: "被动-区间型", desc: "每天指定时间段内为真；仅被逻辑规则引用时实时求值。" },
-        random: { label: "被动-随机型", desc: "以给定概率为真；仅被逻辑规则引用时采样一次。" },
-        cooldown: { label: "被动-冷却型", desc: "距上次成功发送超过冷却时长为真；仅被逻辑规则引用时实时求值。" },
-    };
+    // ── 触发器：图形化框图 ──
+    function activeTriggers() { return triggers.filter(t => ACTIVE_TYPES.includes(t.type)); }
+    function passiveTriggers() { return triggers.filter(t => PASSIVE_TYPES.includes(t.type)); }
 
-    function nextAvailableTriggerId() {
-        const used = new Set();
-        document.querySelectorAll("#triggers-list .trigger-card").forEach(c => used.add(parseInt(c.dataset.tid)));
-        let id = 1;
-        while (used.has(id)) id++;
-        return id;
+    function defaultConfigFor(type) {
+        if (type === "interval") return { base_time: defaultBaseTime(), days: 0, hours: 1, minutes: 0 };
+        if (type === "cron") return { expr: "" };
+        if (type === "window") return { start: "08:00", end: "20:00", weekdays: [0, 1, 2, 3, 4, 5, 6] };
+        if (type === "random") return { threshold: 0.5 };
+        return { hours: 4, minutes: 0 };
     }
 
-    function addTriggerRow(data) {
-        const list = $("triggers-list");
-        const id = (data && data.id) || nextAvailableTriggerId();
-        const card = document.createElement("div");
-        card.className = "trigger-card";
-        card.dataset.tid = id;
-        const type = (data && data.type) || "interval";
-        const cfg = (data && data.config) || {};
-        card.innerHTML = `
-            <div class="trigger-card-header">
-                <span class="trigger-id-badge">${id}</span>
-                <select class="trigger-type-select">
-                    ${Object.keys(TYPE_LABELS).map(k => `<option value="${k}" ${k===type?'selected':''}>${TYPE_LABELS[k].label}</option>`).join("")}
-                </select>
-                <button class="btn btn-danger btn-sm remove-trigger-btn" type="button"><span>删除</span></button>
-            </div>
-            <div class="trigger-type-desc">${TYPE_LABELS[type].desc}</div>
-            <div class="trigger-config-fields"></div>
-            <div class="trigger-next-fire"></div>
-        `;
-        list.appendChild(card);
-        renderTriggerFields(card, type, cfg);
-        card.querySelector(".trigger-type-select").addEventListener("change", e => {
-            card.querySelector(".trigger-type-desc").textContent = TYPE_LABELS[e.target.value].desc;
-            renderTriggerFields(card, e.target.value, {});
-            renderTemplateVars();
-            scheduleValidate();
-        });
-        card.querySelector(".remove-trigger-btn").addEventListener("click", () => {
-            card.remove();
-            renderTemplateVars();
-            scheduleValidate();
-        });
-        card.addEventListener("input", scheduleValidate);
-        card.addEventListener("change", scheduleValidate);
-        return id;
-    }
-
-    function renderTriggerFields(card, type, cfg) {
-        const fields = card.querySelector(".trigger-config-fields");
-        let html = "";
-        if (type === "interval") {
-            const baseVal = toDatetimeLocal(cfg.base_time) || defaultBaseTime();
-            html = `
-                <div class="full-row interval-row">
-                    <span class="interval-duration-label">周期时长</span>
-                    <input type="number" class="form-input field-days" min="0" value="${cfg.days||0}"><span class="unit">天</span>
-                    <input type="number" class="form-input field-hours" min="0" value="${cfg.hours||0}"><span class="unit">小时</span>
-                    <input type="number" class="form-input field-minutes" min="0" value="${cfg.minutes||0}"><span class="unit">分钟</span>
-                </div>
-                <div class="full-row"><label class="form-hint">基准时间（从此时间起按周期累加触发，默认=创建当天 0:00）</label><input type="datetime-local" class="form-input field-base-time" value="${escapeHtml(baseVal)}"></div>
-            `;
-        } else if (type === "cron") {
-            html = `
-                <div class="full-row"><label class="form-hint">cron 表达式（5段：分 时 日 月 周）</label><input type="text" class="form-input field-expr" placeholder="0 */4 * * *" value="${escapeHtml(cfg.expr||'')}"></div>
-            `;
-        } else if (type === "window") {
-            const wd = cfg.weekdays || [];
-            const days = ["周一","周二","周三","周四","周五","周六","周日"];
-            html = `
-                <div><label class="form-hint">起始 HH:MM</label><input type="time" class="form-input field-start" value="${escapeHtml(cfg.start||'08:00')}"></div>
-                <div><label class="form-hint">结束 HH:MM</label><input type="time" class="form-input field-end" value="${escapeHtml(cfg.end||'20:00')}"></div>
-                <div class="full-row"><label class="form-hint">星期（不选=每天）</label>
-                    <div class="weekdays-group">
-                        ${days.map((d,i) => `<label class="weekday-chip ${wd.includes(i)?'checked':''}"><input type="checkbox" value="${i}" ${wd.includes(i)?'checked':''}>${d}</label>`).join("")}
-                    </div>
-                </div>
-            `;
-        } else if (type === "random") {
-            html = `<div><label class="form-hint">概率值 (0-1)</label><input type="number" class="form-input field-threshold" min="0" max="1" step="0.01" value="${cfg.threshold!=null?cfg.threshold:0.5}"></div>`;
-        } else if (type === "cooldown") {
-            html = `
-                <div><label class="form-hint">小时</label><input type="number" class="form-input field-hours" min="0" value="${cfg.hours||0}"></div>
-                <div><label class="form-hint">分钟</label><input type="number" class="form-input field-minutes" min="0" value="${cfg.minutes||0}"></div>
-            `;
+    function triggerSummaryText(t) {
+        const c = t.config || {};
+        if (t.type === "interval") {
+            const d = parseInt(c.days) || 0, h = parseInt(c.hours) || 0, m = parseInt(c.minutes) || 0;
+            const parts = [];
+            if (d) parts.push(d + "天");
+            if (h) parts.push(h + "时");
+            if (m || !parts.length) parts.push(m + "分");
+            return "每 " + parts.join("");
         }
-        fields.innerHTML = html;
-        fields.querySelectorAll(".weekday-chip").forEach(chip => {
-            const cb = chip.querySelector("input");
+        if (t.type === "cron") return c.expr ? c.expr : "未填写表达式";
+        if (t.type === "window") {
+            const wd = Array.isArray(c.weekdays) ? c.weekdays : [];
+            const scope = wd.length ? "每周" + wd.map(i => WEEKDAY_CN[i] ? WEEKDAY_CN[i][1] : "").join("") : "每天";
+            return `${scope} ${c.start || "00:00"}-${c.end || "23:59"}`;
+        }
+        if (t.type === "random") return `概率 ${c.threshold != null ? c.threshold : 0.5}`;
+        if (t.type === "cooldown") return `冷却 ${parseInt(c.hours) || 0}时${parseInt(c.minutes) || 0}分`;
+        return "";
+    }
+
+    const NODE_W = 176, NODE_H = 62, GAP_X = 58, GAP_Y = 24, PAD = 24;
+
+    function renderTriggerCanvas() {
+        const canvas = $("trigger-canvas");
+        const actives = activeTriggers();
+        const passives = passiveTriggers();
+        const startR = 20;
+        const startX = PAD + startR;
+        const activeX = PAD + startR * 2 + 26;
+        const chainX = activeX + NODE_W + GAP_X;
+        const targetW = 96, targetH = 46;
+        const rows = Math.max(actives.length, 1);
+        const colH = rows * NODE_H + (rows - 1) * GAP_Y;
+        const midY = PAD + colH / 2;
+        const passiveX = i => chainX + i * (NODE_W + GAP_X);
+        const targetX = passives.length
+            ? passiveX(passives.length - 1) + NODE_W + GAP_X
+            : activeX + NODE_W + GAP_X;
+        const width = targetX + targetW + PAD;
+        const height = PAD * 2 + colH;
+        const nodeTop = i => PAD + i * (NODE_H + GAP_Y);
+        const nodeCy = i => nodeTop(i) + NODE_H / 2;
+
+        const wires = [];
+        if (actives.length) {
+            actives.forEach((t, i) => {
+                wires.push(`<path class="wire" d="M ${startX + startR} ${midY} C ${startX + startR + 30} ${midY}, ${activeX - 30} ${nodeCy(i)}, ${activeX} ${nodeCy(i)}"/>`);
+                const fromX = activeX + NODE_W;
+                const toX = passives.length ? passiveX(0) : targetX;
+                wires.push(`<path class="wire" d="M ${fromX} ${nodeCy(i)} C ${fromX + 30} ${nodeCy(i)}, ${toX - 30} ${midY}, ${toX} ${midY}" marker-end="url(#trigger-arrow)"/>`);
+            });
+        } else {
+            wires.push(`<path class="wire dashed" d="M ${startX + startR} ${midY} L ${targetX} ${midY}" marker-end="url(#trigger-arrow)"/>`);
+        }
+        passives.forEach((t, i) => {
+            if (i > 0) wires.push(`<path class="wire" d="M ${passiveX(i - 1) + NODE_W} ${midY} L ${passiveX(i)} ${midY}"/>`);
+            if (i === passives.length - 1) wires.push(`<path class="wire" d="M ${passiveX(i) + NODE_W} ${midY} L ${targetX} ${midY}" marker-end="url(#trigger-arrow)"/>`);
+        });
+
+        const nodeHtml = (t, style) => `
+            <div class="tnode ${TYPE_INFO[t.type].kind === "active" ? "active" : "passive"}${t.id === selectedTriggerId ? " selected" : ""}" data-tid="${t.id}" style="${style}">
+                <span class="tnode-id">${t.id}</span>
+                <span class="tnode-label">${TYPE_INFO[t.type].label}</span>
+                <span class="tnode-sub">${escapeHtml(triggerSummaryText(t))}</span>
+            </div>`;
+
+        canvas.style.width = width + "px";
+        canvas.style.height = height + "px";
+        canvas.innerHTML = `
+            <svg class="trigger-wires" width="${width}" height="${height}">
+                <defs>
+                    <marker id="trigger-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                        <path d="M 0 0 L 8 4 L 0 8 z" fill="rgba(148,163,184,0.9)"></path>
+                    </marker>
+                </defs>
+                ${wires.join("")}
+            </svg>
+            <div class="tnode tstart" style="left:${PAD}px;top:${midY - startR}px;width:${startR * 2}px;height:${startR * 2}px;">Start</div>
+            ${actives.map((t, i) => nodeHtml(t, `left:${activeX}px;top:${nodeTop(i)}px;width:${NODE_W}px;height:${NODE_H}px;`)).join("")}
+            ${passives.map((t, i) => nodeHtml(t, `left:${passiveX(i)}px;top:${midY - NODE_H / 2}px;width:${NODE_W}px;height:${NODE_H}px;`)).join("")}
+            <div class="tnode ttarget" style="left:${targetX}px;top:${midY - targetH / 2}px;width:${targetW}px;height:${targetH}px;">Target</div>
+            ${actives.length ? "" : `<div class="canvas-hint" style="left:${activeX}px;top:${midY + 44}px;">还没有主动型触发器：任务不会自动触发</div>`}
+        `;
+        canvas.querySelectorAll(".tnode[data-tid]").forEach(el => {
+            el.addEventListener("click", () => {
+                selectedTriggerId = parseInt(el.dataset.tid);
+                renderTriggerCanvas();
+                renderTriggerPanel();
+            });
+        });
+        updateCanvasErrors();
+    }
+
+    function renderTriggerPanel() {
+        const panel = $("trigger-panel");
+        const t = triggers.find(x => x.id === selectedTriggerId);
+        if (!t) {
+            panel.innerHTML = `<div class="empty-hint">点击上方节点查看并编辑该触发器的配置。</div>`;
+            return;
+        }
+        const info = TYPE_INFO[t.type];
+        const options = (info.kind === "active" ? ACTIVE_TYPES : PASSIVE_TYPES)
+            .map(k => `<option value="${k}" ${k === t.type ? "selected" : ""}>${TYPE_INFO[k].label}</option>`).join("");
+        panel.innerHTML = `
+            <div class="trigger-panel-header">
+                <span class="trigger-id-badge">${t.id}</span>
+                <select class="trigger-type-select" id="panel-type-select">${options}</select>
+                <span class="trigger-type-desc">${escapeHtml(info.desc)}</span>
+                <button class="btn btn-danger btn-sm" type="button" id="panel-delete-btn"><span>删除</span></button>
+            </div>
+            ${renderTriggerFields(t)}
+            <div class="trigger-next-fire" id="panel-next-fire"></div>
+        `;
+        $("panel-type-select").addEventListener("change", e => {
+            t.type = e.target.value;
+            t.config = defaultConfigFor(t.type);
+            renderTriggerCanvas();
+            renderTriggerPanel();
+            scheduleValidate();
+        });
+        $("panel-delete-btn").addEventListener("click", () => removeTrigger(t.id));
+        panel.querySelectorAll("[data-field]").forEach(el => {
+            el.addEventListener("input", () => syncPanelToTrigger(t));
+            el.addEventListener("change", () => syncPanelToTrigger(t));
+        });
+        panel.querySelectorAll(".weekday-chip input").forEach(cb => {
             cb.addEventListener("change", () => {
-                chip.classList.toggle("checked", cb.checked);
+                cb.closest(".weekday-chip").classList.toggle("checked", cb.checked);
+                syncPanelToTrigger(t);
+            });
+        });
+        updatePanelNextFire();
+    }
+
+    function renderTriggerFields(t) {
+        const c = t.config || {};
+        if (t.type === "interval") {
+            const baseVal = toDatetimeLocal(c.base_time) || defaultBaseTime();
+            return `
+                <div class="trigger-config-fields">
+                    <div class="full-row interval-row">
+                        <span class="interval-duration-label">周期时长</span>
+                        <input type="number" class="form-input" data-field="days" min="0" value="${parseInt(c.days) || 0}"><span class="unit">天</span>
+                        <input type="number" class="form-input" data-field="hours" min="0" value="${parseInt(c.hours) || 0}"><span class="unit">小时</span>
+                        <input type="number" class="form-input" data-field="minutes" min="0" value="${parseInt(c.minutes) || 0}"><span class="unit">分钟</span>
+                    </div>
+                    <div class="full-row"><label class="form-hint">基准时间（从此时间起按周期累加触发）</label>
+                        <input type="datetime-local" class="form-input" data-field="base_time" value="${escapeHtml(baseVal)}"></div>
+                </div>`;
+        }
+        if (t.type === "cron") {
+            return `
+                <div class="trigger-config-fields">
+                    <div class="full-row"><label class="form-hint">cron 表达式（5段：分 时 日 月 周）</label>
+                        <input type="text" class="form-input" data-field="expr" placeholder="0 */4 * * *" value="${escapeHtml(c.expr || "")}"></div>
+                </div>`;
+        }
+        if (t.type === "window") {
+            const wd = Array.isArray(c.weekdays) ? c.weekdays : [];
+            return `
+                <div class="trigger-config-fields">
+                    <div><label class="form-hint">起始 HH:MM</label><input type="time" class="form-input" data-field="start" value="${escapeHtml(c.start || "08:00")}"></div>
+                    <div><label class="form-hint">结束 HH:MM</label><input type="time" class="form-input" data-field="end" value="${escapeHtml(c.end || "20:00")}"></div>
+                    <div class="full-row"><label class="form-hint">星期（默认全都选中）</label>
+                        <div class="weekdays-group">
+                            ${WEEKDAY_CN.map((d, i) => `<label class="weekday-chip ${wd.includes(i) ? "checked" : ""}"><input type="checkbox" data-weekday="${i}" ${wd.includes(i) ? "checked" : ""}>${d}</label>`).join("")}
+                        </div>
+                    </div>
+                </div>`;
+        }
+        if (t.type === "random") {
+            return `
+                <div class="trigger-config-fields">
+                    <div><label class="form-hint">概率值 (0-1)</label>
+                        <input type="number" class="form-input" data-field="threshold" min="0" max="1" step="0.01" value="${c.threshold != null ? c.threshold : 0.5}"></div>
+                </div>`;
+        }
+        return `
+            <div class="trigger-config-fields">
+                <div><label class="form-hint">小时</label><input type="number" class="form-input" data-field="hours" min="0" value="${parseInt(c.hours) || 0}"></div>
+                <div><label class="form-hint">分钟</label><input type="number" class="form-input" data-field="minutes" min="0" value="${parseInt(c.minutes) || 0}"></div>
+                <div class="full-row"><label class="form-hint">上次任务成功时间：${lastSuccessTime ? fmtTs(lastSuccessTime) : "从未成功执行"}</label></div>
+            </div>`;
+    }
+
+    function syncPanelToTrigger(t) {
+        const panel = $("trigger-panel");
+        const get = f => { const el = panel.querySelector(`[data-field="${f}"]`); return el ? el.value : ""; };
+        const int = (f, d) => { const v = parseInt(get(f)); return isNaN(v) ? d : v; };
+        if (t.type === "interval") {
+            t.config = { days: int("days", 0), hours: int("hours", 0), minutes: int("minutes", 0), base_time: get("base_time") };
+        } else if (t.type === "cron") {
+            t.config = { expr: get("expr").trim() };
+        } else if (t.type === "window") {
+            t.config = {
+                start: get("start") || "00:00",
+                end: get("end") || "23:59",
+                weekdays: Array.from(panel.querySelectorAll(".weekday-chip input:checked")).map(cb => parseInt(cb.dataset.weekday)),
+            };
+        } else if (t.type === "random") {
+            const v = parseFloat(get("threshold"));
+            t.config = { threshold: isNaN(v) ? 0 : v };
+        } else if (t.type === "cooldown") {
+            t.config = { hours: int("hours", 0), minutes: int("minutes", 0) };
+        }
+        renderTriggerCanvas();
+        updateValidateHints();
+        scheduleValidate();
+    }
+
+    function removeTrigger(id) {
+        triggers = triggers.filter(t => t.id !== id);
+        if (selectedTriggerId === id) selectedTriggerId = triggers.length ? triggers[0].id : null;
+        renderTriggerCanvas();
+        renderTriggerPanel();
+        updateValidateHints();
+        scheduleValidate();
+    }
+
+    function addTrigger(kind) {
+        const type = kind === "active" ? "interval" : "window";
+        const t = { id: nextTriggerId++, type, config: defaultConfigFor(type) };
+        triggers.push(t);
+        selectedTriggerId = t.id;
+        renderTriggerCanvas();
+        renderTriggerPanel();
+        updateValidateHints();
+        scheduleValidate();
+    }
+    $("add-active-trigger-btn").addEventListener("click", () => addTrigger("active"));
+    $("add-passive-trigger-btn").addEventListener("click", () => addTrigger("passive"));
+
+    // ── 发送对象（UMO tag 多选） ──
+    function renderTargetPicker() {
+        $("target-select").innerHTML = `<option value="">选择活跃会话…</option>` +
+            sessionsList.map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join("");
+    }
+    function renderTargets() {
+        const box = $("targets-tags");
+        if (!targets.length) {
+            box.innerHTML = `<span class="empty-hint">尚未选择发送对象</span>`;
+            return;
+        }
+        box.innerHTML = targets.map((u, i) =>
+            `<span class="umo-tag">${escapeHtml(u)}<span class="umo-tag-close" data-idx="${i}" title="移除">×</span></span>`
+        ).join("");
+        box.querySelectorAll(".umo-tag-close").forEach(el => {
+            el.addEventListener("click", () => {
+                targets.splice(parseInt(el.dataset.idx), 1);
+                renderTargets();
             });
         });
     }
-
-    function collectTriggers() {
-        const triggers = [];
-        document.querySelectorAll("#triggers-list .trigger-card").forEach(card => {
-            const id = parseInt(card.dataset.tid);
-            const type = card.querySelector(".trigger-type-select").value;
-            const cfg = {};
-            if (type === "interval") {
-                cfg.days = parseInt(card.querySelector(".field-days").value) || 0;
-                cfg.hours = parseInt(card.querySelector(".field-hours").value) || 0;
-                cfg.minutes = parseInt(card.querySelector(".field-minutes").value) || 0;
-                cfg.base_time = card.querySelector(".field-base-time").value.trim();
-            } else if (type === "cron") {
-                cfg.expr = card.querySelector(".field-expr").value.trim();
-            } else if (type === "window") {
-                cfg.start = card.querySelector(".field-start").value || "00:00";
-                cfg.end = card.querySelector(".field-end").value || "23:59";
-                cfg.weekdays = Array.from(card.querySelectorAll(".weekday-chip input:checked")).map(c => parseInt(c.value));
-            } else if (type === "random") {
-                cfg.threshold = parseFloat(card.querySelector(".field-threshold").value);
-            } else if (type === "cooldown") {
-                cfg.hours = parseInt(card.querySelector(".field-hours").value) || 0;
-                cfg.minutes = parseInt(card.querySelector(".field-minutes").value) || 0;
-            }
-            triggers.push({ id, type, config: cfg });
-        });
-        return triggers;
+    function addTarget(value) {
+        const v = String(value || "").trim();
+        if (!v || targets.includes(v)) return;
+        targets.push(v);
+        renderTargets();
     }
-
-    function appendLogicFor(id) {
-        const input = $("task-logic");
-        const cur = input.value.trim();
-        input.value = cur ? `${cur}*${id}` : String(id);
-    }
-    $("add-trigger-btn").addEventListener("click", () => {
-        const newId = addTriggerRow(null);
-        appendLogicFor(newId);
-        renderTemplateVars();
-        scheduleValidate();
+    $("target-select").addEventListener("change", () => {
+        addTarget($("target-select").value);
+        $("target-select").value = "";
     });
-
-    // ── 发送对象管理 ──
-    function sessionOptionList(extraValue) {
-        const ordered = [];
-        const seen = new Set();
-        sessionsList.forEach(s => { if (!seen.has(s)) { seen.add(s); ordered.push(s); } });
-        if (extraValue && !seen.has(extraValue)) ordered.push(extraValue);
-        return ordered.map(s => `<option value="${escapeHtml(s)}">${escapeHtml(maskUmo(s))}</option>`).join("");
-    }
-    function addTargetRow(value) {
-        const list = $("targets-list");
-        const row = document.createElement("div");
-        row.className = "target-row";
-        row.innerHTML = `
-            <select class="target-select form-input">
-                <option value="">选择会话…</option>
-                <option value="__custom__">手动输入 UMO…</option>
-                ${sessionOptionList(value)}
-            </select>
-            <input type="text" class="target-input form-input" placeholder="default:FriendMessage:..." style="display:none">
-            <button class="btn btn-danger btn-sm remove-target-btn" type="button"><span>删除</span></button>
-        `;
-        list.appendChild(row);
-        const sel = row.querySelector(".target-select");
-        const inp = row.querySelector(".target-input");
-        if (value) {
-            if (sessionsList.includes(value)) {
-                sel.value = value;
-            } else {
-                sel.value = "__custom__";
-                inp.value = value;
-                inp.style.display = "block";
-            }
-        }
-        sel.addEventListener("change", () => {
-            if (sel.value === "__custom__") { inp.style.display = "block"; inp.focus(); }
-            else { inp.style.display = "none"; }
-        });
-        row.querySelector(".remove-target-btn").addEventListener("click", () => { row.remove(); });
-    }
-    function collectTargets() {
-        return Array.from(document.querySelectorAll("#targets-list .target-row")).map(row => {
-            const sel = row.querySelector(".target-select");
-            if (sel.value === "__custom__") return row.querySelector(".target-input").value.trim();
-            return sel.value;
-        }).filter(v => v);
-    }
-    $("add-target-btn").addEventListener("click", () => { addTargetRow(""); });
+    $("target-custom").addEventListener("keydown", e => {
+        if (e.key !== "Enter") return;
+        e.preventDefault();
+        addTarget($("target-custom").value);
+        $("target-custom").value = "";
+    });
 
     // ── 任务内容模式说明 ──
     const MODE_INFO = {
         fixed: {
-            detail: "将下方文本（渲染 {{变量}} 后）直接作为消息发送到目标，不经过 AI。",
-            requirement: "输入要求：要发送的固定消息，支持 {{time}} {{date}} {{weekday}} 及触发器结果 {{n}}（n=触发器编号）。",
+            detail: "直接把下方文本作为消息发送到目标，不经过 AI。",
+            label: "发送内容",
+            requirement: "输入要求：要发送的固定消息原文。固定文本不支持参数，需要时间信息请改用 AI 模式。",
         },
         standalone: {
-            detail: "使用上方「独立 AI 系统提示」作为 system prompt + 下方任务提示词，单独调用 AI 生成回复后发送，不携带对话人格、不与其他插件互动。",
-            requirement: "输入要求：给 AI 的任务提示词（作为 user 消息），支持 {{time}} {{date}} {{weekday}} 及触发器结果 {{n}}（n=触发器编号）。",
+            detail: "使用上方「独立 AI 系统提示」+ 下方任务提示词单独调用 AI 生成回复，不携带对话人格、不与其他插件互动。",
+            label: "任务提示词",
+            requirement: "输入要求：给 AI 的指令。发送时会统一包裹为 <scheduled_task>…</scheduled_task>，用户提示词不支持参数。",
         },
         conversation: {
-            detail: "将下方任务提示词交给目标对话配置的 AI 生成回复后发送，会携带该对话的人格 system prompt 及记忆插件注入。",
-            requirement: "输入要求：给 AI 的任务提示词（作为 user 消息），支持 {{time}} {{date}} {{weekday}} 及触发器结果 {{n}}（n=触发器编号）。",
+            detail: "把下方任务提示词交给目标对话配置的 AI 生成回复，携带该对话的人格 system prompt 与记忆插件注入。",
+            label: "任务提示词",
+            requirement: "输入要求：给 AI 的指令。发送时会统一包裹为 <scheduled_task>…</scheduled_task>，用户提示词不支持参数。",
         },
     };
     function updateContentMode() {
@@ -712,163 +842,116 @@ async function init() {
         const info = MODE_INFO[mode] || MODE_INFO.fixed;
         $("content-mode-detail").textContent = info.detail;
         $("content-mode-requirement").textContent = info.requirement;
-        // 系统提示仅「独立 AI 回复」模式可编辑
-        const sp = $("task-system-prompt");
-        const isStandalone = mode === "standalone";
-        sp.disabled = !isStandalone;
-        sp.classList.toggle("disabled", !isStandalone);
+        $("task-text-label").textContent = info.label;
+        // 独立 AI 系统提示仅 standalone 模式使用
+        $("system-prompt-group").style.display = mode === "standalone" ? "" : "none";
+        // 两个感知开关仅对两种 AI 模式生效
+        setSwitchDisabled("task-time-aware", mode === "fixed");
+        setSwitchDisabled("task-holiday-aware", mode === "fixed");
+    }
+    function setSwitchDisabled(id, disabled) {
+        const el = $(id);
+        el.disabled = disabled;
+        el.closest(".switch-toggle").classList.toggle("disabled", disabled);
     }
     $("task-mode").addEventListener("change", updateContentMode);
 
-    // ── 模板变量及当前值（点击按钮插入到文本框光标处） ──
-    function triggerResultPreview(type, cfg) {
-        cfg = cfg || {};
-        if (type === "interval") {
-            const d = parseInt(cfg.days) || 0, h = parseInt(cfg.hours) || 0, m = parseInt(cfg.minutes) || 0;
-            return `周期型触发器（周期${d}天${h}时${m}分）`;
-        }
-        if (type === "cron") return `CRON型触发器（${cfg.expr || "…"}）`;
-        if (type === "window") {
-            const wd = Array.isArray(cfg.weekdays) ? cfg.weekdays : [];
-            const cn = ["一", "二", "三", "四", "五", "六", "日"];
-            const scope = wd.length ? "每周" + wd.map(i => cn[i]).join("") : "每天";
-            return `区间触发器：${scope}${cfg.start || "00:00"}-${cfg.end || "23:59"}`;
-        }
-        if (type === "random") {
-            const th = (cfg.threshold != null && isFinite(cfg.threshold)) ? cfg.threshold : 0.5;
-            return `随机触发器：?<${th}`;
-        }
-        if (type === "cooldown") {
-            const h = parseInt(cfg.hours) || 0, m = parseInt(cfg.minutes) || 0;
-            return `冷却触发器：大于${h}时${m}分`;
-        }
-        return "触发器结果";
-    }
-    function renderTemplateVars() {
-        const now = new Date();
-        const p = n => String(n).padStart(2, "0");
-        const time = `${now.getFullYear()}-${p(now.getMonth()+1)}-${p(now.getDate())} ${p(now.getHours())}:${p(now.getMinutes())}:${p(now.getSeconds())}`;
-        const date = `${now.getFullYear()}-${p(now.getMonth()+1)}-${p(now.getDate())}`;
-        const weekday = "周" + "一二三四五六日"[pyWeekday(now)];
-        const items = [
-            { k: "time", v: time },
-            { k: "date", v: date },
-            { k: "weekday", v: weekday },
-        ];
-        // 触发器结果变量 {{id}}：按当前已添加的触发器动态生成，点击插入 {{n}}
-        collectTriggers().forEach(tg => {
-            items.push({ k: String(tg.id), v: triggerResultPreview(tg.type, tg.config || {}) });
-        });
-        $("template-vars").innerHTML = items.map(it =>
-            `<button type="button" class="var-btn" data-tag="{{${it.k}}}"><code>{{${it.k}}}</code><span class="var-value">${escapeHtml(String(it.v))}</span></button>`
-        ).join("");
-        $("template-vars").querySelectorAll(".var-btn").forEach(btn => {
-            btn.addEventListener("click", () => insertAtCursor($("task-text"), btn.getAttribute("data-tag")));
-        });
-    }
-
-    function insertAtCursor(textarea, text) {
-        const start = textarea.selectionStart;
-        const end = textarea.selectionEnd;
-        const val = textarea.value;
-        textarea.value = val.slice(0, start) + text + val.slice(end);
-        const pos = start + text.length;
-        textarea.focus();
-        textarea.setSelectionRange(pos, pos);
-        textarea.dispatchEvent(new Event("input", { bubbles: true }));
-    }
-
-    // ── 逻辑规则实时校验 + 下次触发预览 ──
+    // ── 触发器实时校验 + 下次检查触发时间 ──
     function scheduleValidate() {
         clearTimeout(validateTimer);
         validateTimer = setTimeout(doValidate, 400);
     }
-    async function doValidate() {
-        const triggers = collectTriggers();
-        const logic = $("task-logic").value.trim();
-        const statusEl = $("logic-status");
-        const nextEl = $("next-fire-hint");
-        if (!triggers.length) {
-            statusEl.textContent = "请先添加触发器";
-            statusEl.style.color = "var(--color-warning)";
-            nextEl.textContent = "";
+    function updateValidateHints() {
+        const el = $("next-fire-hint");
+        if (!activeTriggers().length) {
+            el.textContent = "无主动型触发器，任务不会自动触发";
+            el.style.color = "var(--color-danger)";
             return;
         }
-        if (!logic) {
-            statusEl.textContent = "请填写逻辑规则";
-            statusEl.style.color = "var(--color-warning)";
-            nextEl.textContent = "";
-            return;
-        }
-        try {
-            const res = await bridge.apiPost("validate", { triggers, logic_expr: logic });
-            if (!res || res.status !== "success") { return; }
-            const r = res.results;
-            updateTriggerNextFire(r.triggers);
-            const trigErrs = (r.triggers || []).filter(t => !t.ok).map(t => `#${t.id}: ${t.msg}`);
-            const logicOk = r.logic && r.logic.ok;
-            if (trigErrs.length) {
-                statusEl.innerHTML = "触发器配置有误: " + escapeHtml(trigErrs.join("; "));
-                statusEl.style.color = "var(--color-danger)";
-            } else if (logicOk) {
-                statusEl.textContent = "√ 规则合法";
-                statusEl.style.color = "var(--color-success)";
-            } else {
-                statusEl.textContent = "规则错误: " + (r.logic ? r.logic.msg : "未知");
-                statusEl.style.color = "var(--color-danger)";
-            }
-            if (trigErrs.length) {
-                nextEl.textContent = "";
-            } else if (r.next_fire) {
-                nextEl.textContent = "下次检查触发时间: " + fmtTs(r.next_fire);
-                nextEl.style.color = "var(--color-primary)";
-            } else {
-                nextEl.textContent = "无主动触发器，不会自动触发";
-                nextEl.style.color = "var(--text-secondary)";
-            }
-        } catch (e) { /* 静默 */ }
+        el.textContent = lastValidate.next_fire
+            ? "下次检查触发时间: " + fmtTs(lastValidate.next_fire)
+            : "下次检查触发时间：待计算…";
+        el.style.color = "var(--color-primary)";
     }
-    function updateTriggerNextFire(trigResults) {
-        (trigResults || []).forEach(tr => {
-            const card = document.querySelector(`#triggers-list .trigger-card[data-tid="${tr.id}"]`);
-            if (!card) return;
-            const el = card.querySelector(".trigger-next-fire");
-            if (!el) return;
-            const type = card.querySelector(".trigger-type-select").value;
-            if (type === "interval" || type === "cron") {
-                const fires = tr.future_fires || [];
-                if (fires.length) {
-                    el.textContent = "未来触发: " + fires.map(f => fmtTs(f)).join("，");
-                    el.className = "trigger-next-fire active";
-                } else {
-                    el.textContent = "无法计算未来触发（请检查配置）";
-                    el.className = "trigger-next-fire";
-                }
-            } else {
-                el.textContent = "被动触发器：无固定触发点，被逻辑规则引用时实时求值";
-                el.className = "trigger-next-fire";
-            }
+    function updatePanelNextFire() {
+        const el = $("panel-next-fire");
+        const t = triggers.find(x => x.id === selectedTriggerId);
+        if (!el || !t) return;
+        const r = (lastValidate.triggers || []).find(x => x.id === t.id);
+        if (r && !r.ok) {
+            el.textContent = "配置有误：" + r.msg;
+            el.className = "trigger-next-fire error";
+            return;
+        }
+        if (ACTIVE_TYPES.includes(t.type)) {
+            const fires = (r && r.future_fires) || [];
+            el.textContent = fires.length ? "未来触发: " + fires.map(f => fmtTs(f)).join("，") : "未来触发：请完成配置……";
+            el.className = fires.length ? "trigger-next-fire active" : "trigger-next-fire";
+        } else {
+            el.textContent = "被动触发器：无固定触发点，被主动型触发器唤起后实时求值";
+            el.className = "trigger-next-fire";
+        }
+    }
+    function updateCanvasErrors() {
+        (lastValidate.triggers || []).forEach(r => {
+            const node = document.querySelector(`#trigger-canvas .tnode[data-tid="${r.id}"]`);
+            if (node) node.classList.toggle("invalid", !r.ok);
         });
     }
-    $("task-logic").addEventListener("input", scheduleValidate);
+    async function doValidate() {
+        if (!modal.classList.contains("active")) return;
+        const payload = triggers.map(t => ({ id: t.id, type: t.type, config: t.config }));
+        try {
+            const res = await bridge.apiPost("validate", { triggers: payload });
+            if (!res || res.status !== "success") return;
+            lastValidate = res.results || { triggers: [], next_fire: null };
+            updateValidateHints();
+            updatePanelNextFire();
+            updateCanvasErrors();
+        } catch (e) { /* 静默 */ }
+    }
+
+    // ── 画布平移（按住空白处拖动） ──
+    const canvasViewport = $("trigger-canvas-viewport");
+    let panState = null;
+    canvasViewport.addEventListener("mousedown", e => {
+        if (e.target.closest(".tnode")) return;
+        panState = { x: e.clientX, y: e.clientY, sl: canvasViewport.scrollLeft, st: canvasViewport.scrollTop };
+        canvasViewport.classList.add("panning");
+        e.preventDefault();
+    });
+    window.addEventListener("mousemove", e => {
+        if (!panState) return;
+        canvasViewport.scrollLeft = panState.sl - (e.clientX - panState.x);
+        canvasViewport.scrollTop = panState.st - (e.clientY - panState.y);
+    });
+    window.addEventListener("mouseup", () => {
+        if (!panState) return;
+        panState = null;
+        canvasViewport.classList.remove("panning");
+    });
 
     // ── 提交任务 ──
     $("task-form").addEventListener("submit", async e => {
         e.preventDefault();
         const name = $("task-name").value.trim();
         if (!name) { showToast("请填写任务名称", true); return; }
-        const triggers = collectTriggers();
         if (!triggers.length) { showToast("至少需要一个触发器", true); return; }
-        const logic = $("task-logic").value.trim();
-        if (!logic) { showToast("请填写逻辑规则", true); return; }
+        if (!activeTriggers().length) { showToast("至少需要一个主动型触发器（周期型或 cron 型）", true); return; }
+        if (!targets.length && $("task-text").value.trim()) { showToast("请至少选择一个发送对象", true); return; }
         const payload = {
             id: $("task-id").value || undefined,
             name,
             enabled: $("task-enabled").checked,
-            triggers,
-            logic_expr: logic,
-            content: { text: $("task-text").value, mode: $("task-mode").value, system_prompt: $("task-system-prompt").value },
-            targets: collectTargets(),
+            triggers: triggers.map(t => ({ id: t.id, type: t.type, config: t.config })),
+            content: {
+                text: $("task-text").value,
+                mode: $("task-mode").value,
+                system_prompt: $("task-system-prompt").value,
+                time_aware: $("task-time-aware").checked,
+                holiday_aware: $("task-holiday-aware").checked,
+            },
+            targets: targets.slice(),
         };
         const btn = $("modal-submit-btn");
         btn.disabled = true; btn.textContent = "保存中...";
