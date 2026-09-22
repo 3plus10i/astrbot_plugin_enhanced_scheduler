@@ -12,7 +12,7 @@
             <div class="header-left">
                 <span class="back-btn" id="back-btn">← 返回</span>
                 <h1 class="page-title">增强计划任务</h1>
-                <span class="plugin-version">v1.3.2</span>
+                <span class="plugin-version">v1.4.0</span>
             </div>
             <div class="header-right">
                 <div class="tab-nav">
@@ -39,7 +39,7 @@
                             <thead>
                                 <tr>
                                     <th>名称</th>
-                                    <th>启用</th>
+                                    <th>状态</th>
                                     <th>触发器</th>
                                     <th>预计下次触发</th>
                                     <th>内容</th>
@@ -111,9 +111,9 @@
                         <div class="card-header"><div class="card-header-title-group"><h2 class="card-title">基础配置</h2></div></div>
                         <div class="card-body">
                             <div class="form-group">
-                                <label class="form-label">兜底轮询间隔(秒)</label>
+                                <label class="form-label">最长等待复查间隔(秒)</label>
                                 <input type="number" class="form-input" id="config-poll-interval" min="2" max="3600" required>
-                                <span class="form-hint">仅在任务不含主动触发器或调度计算失败时生效。正常时按最近触发点自适应唤醒，不受此值影响。</span>
+                                <span class="form-hint">每个正常启用的任务最多等待此时长，就醒来检查自己的主动触发器是否到点。没到点则继续等待，不检查被动条件、不调用 AI、不发送消息。触发点更近时会提前醒来，编辑任务也会立即唤醒。用于适应系统时间调整，不改变任务执行周期。默认 600 秒（10 分钟）。</span>
                             </div>
                             <div class="form-group">
                                 <label class="form-label">日志保留条数</label>
@@ -181,10 +181,9 @@
                             <select class="form-input" id="target-select">
                                 <option value="">选择活跃会话…</option>
                             </select>
-                            <input type="text" class="form-input" id="target-custom" placeholder="或手动输入完整 UMO，回车添加">
+                            <input type="text" class="form-input" id="target-custom" placeholder="选择上方会话，或在此输入完整 UMO">
                         </div>
-                        <div class="umo-tags" id="targets-tags"></div>
-                        <span class="form-hint">可添加一个或多个对象，逐个发送并独立记成功/失败。</span>
+                        <span class="form-hint">每个任务只允许一个目标对话；选择会话会替换当前目标。空动作可留空。</span>
                     </div>
 
                     <!-- 触发器（图形化） -->

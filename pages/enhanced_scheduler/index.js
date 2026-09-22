@@ -99,7 +99,7 @@ async function init() {
         }
         body.innerHTML = keys.map(k => {
             const t = allTasks[k];
-            const trgList = t.triggers || [];
+            const trgList = Array.isArray(t.triggers) ? t.triggers.filter(tr => tr && typeof tr === "object") : [];
             const activeCount = trgList.filter(tr => tr.type === "interval" || tr.type === "cron").length;
             const passiveCount = trgList.length - activeCount;
             const trigSummary = `<span class="badge badge-llm">${activeCount} 主动</span> <span class="badge badge-fixed">${passiveCount} 被动</span>`;
@@ -111,14 +111,17 @@ async function init() {
                 ? `<span class="badge ${mode === 'fixed' ? 'badge-fixed' : 'badge-llm'}">${escapeHtml(modeCN)}</span>`
                 : '<span class="badge badge-noop">空动作</span>';
             const nf = t._next_fire;
+            const runtime = t._runtime || {};
+            const stateText = {waiting:"等待中", running:"执行中", faulted:"调度故障", disabled:"停用", needs_configuration:"需要重新配置"}[runtime.state] || (t.enabled ? "启用" : "停用");
+            const stateClass = ["faulted", "needs_configuration"].includes(runtime.state) ? "badge-failed" : (t.enabled ? "badge-active" : "badge-inactive");
             return `
                 <tr>
                     <td class="cell-wrap"><strong>${escapeHtml(t.name)}</strong></td>
-                    <td><span class="badge ${t.enabled ? 'badge-active' : 'badge-inactive'}">${t.enabled ? '启用' : '停用'}</span></td>
+                    <td class="cell-wrap"><span class="badge ${stateClass}">${escapeHtml(stateText)}</span>${runtime.error ? `<div class="form-hint">${escapeHtml(runtime.error)}</div>` : ''}</td>
                     <td class="cell-wrap">${trigSummary || '—'}</td>
                     <td>${nf ? fmtTs(nf) : '—'}</td>
                     <td>${contentBadge}</td>
-                    <td>${(t.targets || []).length} 个</td>
+                    <td class="cell-wrap">${escapeHtml(maskUmo(t.target || "—"))}</td>
                     <td><div class="actions-cell">
                         <button class="btn btn-edit edit-task-btn" data-id="${escapeHtml(k)}">编辑</button>
                         <button class="btn btn-secondary btn-sm copy-task-btn" data-id="${escapeHtml(k)}">复制</button>
@@ -157,14 +160,16 @@ async function init() {
             const actionCN = {send_llm:"LLM发送",send_fixed:"发送文本",noop:"空动作",partial:"部分失败",skipped:"逻辑未过",failed:"失败"}[l.action] || l.action;
             const actionBadge = l.action === "skipped" ? "badge-skipped" : (l.action === "failed" || l.action === "partial" ? "badge-failed" : "badge-active");
             const detail = l.detail || "";
-            const targetsInfo = (l.targets_result || []).map(tr => `${escapeHtml(maskUmo(tr.umo))}:${tr.ok ? '✓' : '✗'+escapeHtml(tr.error||'')}`).join(" ");
+            // Old run logs remain readable; new records have a single target_result.
+            const results = l.target_result ? [l.target_result] : (l.targets_result || []);
+            const targetInfo = results.map(tr => `${maskUmo(tr.umo)}:${tr.ok ? '✓' : '✗' + (tr.error || '')}`).join(" ");
             return `<tr>
                 <td>${fmtTs(l.time)}</td>
                 <td class="cell-wrap">${escapeHtml(l.task_name)}</td>
                 <td class="cell-wrap">${escapeHtml(tofStr)}</td>
                 <td>${l.source === "manual" ? '<span class="badge badge-llm">手动</span>' : (l.logic_result ? '<span class="badge badge-active">通过</span>' : '<span class="badge badge-skipped">未过</span>')}</td>
                 <td><span class="badge ${actionBadge}">${escapeHtml(actionCN)}</span></td>
-                <td class="cell-wrap">${escapeHtml(detail)} ${escapeHtml(targetsInfo)}</td>
+                <td class="cell-wrap">${escapeHtml(detail)} ${escapeHtml(targetInfo)}</td>
             </tr>`;
         }).join("");
         renderLogsPager(pages, total);
@@ -185,7 +190,7 @@ async function init() {
     }
 
     function renderConfig(cfg) {
-        $("config-poll-interval").value = cfg.poll_interval != null ? cfg.poll_interval : 60;
+        $("config-poll-interval").value = cfg.poll_interval != null ? cfg.poll_interval : 600;
         $("config-log-retention").value = cfg.log_retention != null ? cfg.log_retention : 100;
         $("config-llm-timeout").value = cfg.llm_timeout != null ? cfg.llm_timeout : 60;
         $("config-llm-log-retention").value = cfg.llm_log_retention != null ? cfg.llm_log_retention : 10;
@@ -503,7 +508,6 @@ async function init() {
     const WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 
     let triggers = [];            // [{id, type, config}]
-    let targets = [];             // [umo]
     let selectedTriggerId = null;
     let nextTriggerId = 1;
     let lastValidate = { triggers: [], has_active: false, next_fire: null };
@@ -513,10 +517,9 @@ async function init() {
     function closeModal() {
         modal.classList.remove("active");
         $("task-form").reset();
-        triggers = []; targets = []; selectedTriggerId = null;
+        triggers = []; selectedTriggerId = null;
         $("trigger-canvas").innerHTML = "";
         $("trigger-panel").innerHTML = "";
-        $("targets-tags").innerHTML = "";
         setJsonMode(false);
     }
     $("modal-close-btn").addEventListener("click", closeModal);
@@ -547,12 +550,12 @@ async function init() {
             $("task-system-prompt").value = c.system_prompt || "";
             $("task-time-aware").checked = c.time_aware !== false;
             $("task-holiday-aware").checked = c.holiday_aware === true;
-            triggers = (task.triggers || []).map(tr => ({
+            triggers = (Array.isArray(task.triggers) ? task.triggers : []).filter(tr => tr && TYPE_INFO[tr.type]).map(tr => ({
                 id: tr.id,
                 type: tr.type,
                 config: JSON.parse(JSON.stringify(tr.config || {})),
             }));
-            targets = (task.targets || []).slice();
+            $("target-custom").value = task.target || "";
         } else {
             $("modal-title-text").textContent = "新增计划任务";
             $("task-name").value = "";
@@ -561,13 +564,12 @@ async function init() {
             $("task-time-aware").checked = true;
             $("task-holiday-aware").checked = false;
             triggers = [{ id: 1, type: "interval", config: defaultConfigFor("interval") }];
-            targets = [];
+            $("target-custom").value = "";
         }
         nextTriggerId = triggers.reduce((max, t) => Math.max(max, t.id), 0) + 1;
         selectedTriggerId = triggers.length ? triggers[0].id : null;
 
         renderTargetPicker();
-        renderTargets();
         renderTriggerCanvas();
         renderTriggerPanel();
         updateContentMode();
@@ -824,42 +826,20 @@ async function init() {
     $("add-active-trigger-btn").addEventListener("click", () => addTrigger("active"));
     $("add-passive-trigger-btn").addEventListener("click", () => addTrigger("passive"));
 
-    // ── 发送对象（UMO tag 多选） ──
+    // ── 单个发送目标 ──
     function renderTargetPicker() {
         $("target-select").innerHTML = `<option value="">选择活跃会话…</option>` +
             sessionsList.map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join("");
-    }
-    function renderTargets() {
-        const box = $("targets-tags");
-        if (!targets.length) {
-            box.innerHTML = `<span class="empty-hint">尚未选择发送对象</span>`;
-            return;
-        }
-        box.innerHTML = targets.map((u, i) =>
-            `<span class="umo-tag">${escapeHtml(u)}<span class="umo-tag-close" data-idx="${i}" title="移除">×</span></span>`
-        ).join("");
-        box.querySelectorAll(".umo-tag-close").forEach(el => {
-            el.addEventListener("click", () => {
-                targets.splice(parseInt(el.dataset.idx), 1);
-                renderTargets();
-            });
-        });
-    }
-    function addTarget(value) {
-        const v = String(value || "").trim();
-        if (!v || targets.includes(v)) return;
-        targets.push(v);
-        renderTargets();
+        $("target-select").value = sessionsList.includes($("target-custom").value) ? $("target-custom").value : "";
     }
     $("target-select").addEventListener("change", () => {
-        addTarget($("target-select").value);
-        $("target-select").value = "";
+        if ($("target-select").value) $("target-custom").value = $("target-select").value;
+    });
+    $("target-custom").addEventListener("input", () => {
+        $("target-select").value = sessionsList.includes($("target-custom").value) ? $("target-custom").value : "";
     });
     $("target-custom").addEventListener("keydown", e => {
-        if (e.key !== "Enter") return;
-        e.preventDefault();
-        addTarget($("target-custom").value);
-        $("target-custom").value = "";
+        if (e.key === "Enter") e.preventDefault();
     });
 
     // ── 任务内容模式说明 ──
@@ -991,7 +971,7 @@ async function init() {
                 time_aware: $("task-time-aware").checked,
                 holiday_aware: $("task-holiday-aware").checked,
             },
-            targets: targets.slice(),
+            target: $("target-custom").value.trim(),
         };
     }
 
@@ -1013,11 +993,11 @@ async function init() {
             type: t.type,
             config: (t.config && typeof t.config === "object" && !Array.isArray(t.config)) ? t.config : {},
         }));
-        targets = (Array.isArray(obj.targets) ? obj.targets : []).map(String).filter(v => v.trim());
+        $("target-custom").value = obj.target || "";
+        renderTargetPicker();
         nextTriggerId = triggers.reduce((max, t) => Math.max(max, t.id), 0) + 1;
         selectedTriggerId = triggers.length ? triggers[0].id : null;
 
-        renderTargets();
         renderTriggerCanvas();
         renderTriggerPanel();
         updateContentMode();
@@ -1044,6 +1024,10 @@ async function init() {
             showToast("JSON 解析失败：" + e.message, true);
             return;
         }
+        if ("targets" in obj || (obj.target !== undefined && typeof obj.target !== "string")) {
+            showToast("请使用单个 target 对话字符串，不再支持 targets 数组", true);
+            return;
+        }
         applyTaskPayload(obj);
         setJsonMode(false);
     });
@@ -1052,7 +1036,7 @@ async function init() {
         if (!$("task-name").value.trim()) { showToast("请填写任务名称", true); return false; }
         if (!triggers.length) { showToast("至少需要一个触发器", true); return false; }
         if (!activeTriggers().length) { showToast("至少需要一个主动型触发器（周期型或 cron 型）", true); return false; }
-        if (!targets.length && $("task-text").value.trim()) { showToast("请至少选择一个发送对象", true); return false; }
+        if (!$("target-custom").value.trim() && $("task-text").value.trim()) { showToast("请选择一个发送目标对话", true); return false; }
         return true;
     }
 
@@ -1171,7 +1155,7 @@ async function init() {
     $("config-form").addEventListener("submit", async e => {
         e.preventDefault();
         const payload = {
-            poll_interval: parseInt($("config-poll-interval").value) || 60,
+            poll_interval: parseInt($("config-poll-interval").value) || 600,
             log_retention: parseInt($("config-log-retention").value) || 100,
             llm_timeout: parseInt($("config-llm-timeout").value) || 60,
             llm_log_retention: parseInt($("config-llm-log-retention").value) || 500,
@@ -1192,7 +1176,9 @@ async function init() {
     await loadSessions();
     await loadData();
     setInterval(() => {
+        if (document.hidden) return;
         if ($("view-logs").classList.contains("active")) loadRunLogs(logsPage);
+        if ($("view-tasks").classList.contains("active") && !modal.classList.contains("active")) loadData();
     }, 8000);
 }
 

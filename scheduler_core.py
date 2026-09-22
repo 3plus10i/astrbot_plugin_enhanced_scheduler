@@ -309,53 +309,6 @@ def next_trigger_preview(triggers: List[Dict[str, Any]], now_ts: float) -> Optio
     return best
 
 
-def next_fire_over_all(tasks: Dict[str, Any], now_ts: float) -> Optional[float]:
-    """
-    遍历所有任务的所有主动触发器，返回全局最近的下一个触发点（严格大于 now_ts）。
-    供自适应调度主循环计算 sleep 时长。停用的任务、被动触发器不参与。
-    """
-    best: Optional[float] = None
-    for task in tasks.values():
-        if not isinstance(task, dict):
-            continue
-        if not task.get("enabled", True):
-            continue
-        for tg in task.get("triggers", []):
-            if not isinstance(tg, dict):
-                continue
-            if tg.get("type") not in ACTIVE_TYPES:
-                continue
-            lf = float(tg.get("last_fired", 0.0) or 0.0)
-            nf = _next_fire_strictly_after(tg, lf)
-            if nf is not None and nf > now_ts:
-                if best is None or nf < best:
-                    best = nf
-    return best
-
-
-def has_pending_fire(tasks: Dict[str, Any], now_ts: float) -> bool:
-    """
-    是否存在"已到点但尚未处理"的主动触发器（即 next_after(last_fired) <= now）。
-    典型场景：任务配置刚变更（如改间隔），last_fired 继承旧值，新的触发点可能已过。
-    此时应让调度循环立即 tick 处理，而非等待兜底周期。
-    """
-    for task in tasks.values():
-        if not isinstance(task, dict):
-            continue
-        if not task.get("enabled", True):
-            continue
-        for tg in task.get("triggers", []):
-            if not isinstance(tg, dict):
-                continue
-            if tg.get("type") not in ACTIVE_TYPES:
-                continue
-            lf = float(tg.get("last_fired", 0.0) or 0.0)
-            nf = _next_fire_strictly_after(tg, lf)
-            if nf is not None and nf <= now_ts:
-                return True
-    return False
-
-
 # ─────────────────────────────────────────────────────────────────────
 # 未来触发时刻预览
 # 只有主动型触发器（interval / cron）能预测未来触发时刻；逐个复用
