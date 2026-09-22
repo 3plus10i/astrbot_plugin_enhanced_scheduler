@@ -230,68 +230,6 @@ def _next_fire_strictly_after(trigger: Dict[str, Any], after_ts: float) -> Optio
     return None
 
 
-def _latest_fire_at_or_before(trigger: Dict[str, Any], now_ts: float) -> Optional[float]:
-    """返回 <= now_ts 的最近一个主动触发点；若不存在（如 now 早于基准）返回 None。"""
-    ttype = trigger.get("type")
-    cfg = trigger.get("config", {})
-
-    if ttype == T_INTERVAL:
-        interval = _interval_seconds(cfg)
-        if interval <= 0:
-            return None
-        base_dt = _parse_iso(cfg.get("base_time", ""))
-        if base_dt is None:
-            return None
-        base_ts = _ts(base_dt)
-        if now_ts < base_ts:
-            return None
-        elapsed = now_ts - base_ts
-        n = int(math.floor(elapsed / interval))
-        return base_ts + n * interval
-
-    elif ttype == T_CRON:
-        if not _HAS_CRONITER:
-            return None
-        expr = cfg.get("expr", "")
-        try:
-            cr = croniter(expr, _dt(now_ts + 1e-6))
-            return _ts(cr.get_prev(datetime))
-        except Exception:
-            return None
-
-    return None
-
-
-def check_active_fire(trigger: Dict[str, Any], now_ts: float) -> Tuple[bool, Optional[float]]:
-    """
-    判断主动触发器在本次轮询窗口是否到点。
-    返回 (是否触发, 触发点时间戳)。
-    触发点时间戳用于更新 last_fired，确保不会重复触发也不会补发历史。
-
-    策略：
-      - 取 last_fired 之后的下一个触发点 candidate
-      - 若 candidate 存在且 candidate <= now_ts，则触发；
-        触发点取 <= now_ts 的最近触发点（避免宕机后连续补发）
-      - 否则不触发
-    """
-    if trigger.get("type") not in ACTIVE_TYPES:
-        return False, None
-
-    last_fired = float(trigger.get("last_fired", 0.0) or 0.0)
-    candidate = _next_fire_strictly_after(trigger, last_fired)
-    if candidate is None or candidate > now_ts:
-        return False, None
-
-    # 在 (last_fired, now] 内有触发点被跨越；取最近的一个作为本次触发点
-    fire_point = _latest_fire_at_or_before(trigger, now_ts)
-    if fire_point is None:
-        fire_point = candidate
-    # 保证 fire_point 严格大于 last_fired（否则不应触发）
-    if fire_point <= last_fired:
-        return False, None
-    return True, fire_point
-
-
 def next_trigger_preview(triggers: List[Dict[str, Any]], now_ts: float) -> Optional[float]:
     """
     计算所有主动触发器中、基于 now_ts 的最近未来触发点，供页面预览。
@@ -390,7 +328,8 @@ def _window_tof(cfg: Dict[str, Any], now_ts: float) -> bool:
 
 def evaluate_task(triggers: List[Dict[str, Any]],
                   now_ts: float,
-                  task_last_success: float) -> Dict[str, Any]:
+                  task_last_success: float,
+                  active_fire_at: Optional[float] = None) -> Dict[str, Any]:
     """
     一次轮询中对单个任务进行合并评估。固定语义：
 
@@ -404,19 +343,19 @@ def evaluate_task(triggers: List[Dict[str, Any]],
       3. 实时求值所有被动触发器
       4. should_run = 至少一个主动到点 and 所有被动为真
 
+    active_fire_at 为本轮等待实际到达的主动触发点；未传入时不产生主动触发。
+
     返回 dict:
       {
         "should_run": bool,                 # 是否应执行任务
         "has_active_fire": bool,            # 是否有主动触发器到点
         "trigger_tof": {id: bool, ...},     # 各触发器本次评估的 ToF（用于日志）
-        "fired_points": {id: float, ...},   # 到点主动触发器的触发点时间戳（用于更新 last_fired）
       }
     """
     result = {
         "should_run": False,
         "has_active_fire": False,
         "trigger_tof": {},
-        "fired_points": {},
     }
 
     # 先校验触发器；非法则直接返回（不触发）
@@ -424,30 +363,29 @@ def evaluate_task(triggers: List[Dict[str, Any]],
         if not validate_trigger(tg)[0]:
             return result
 
-    # 收集到点的主动触发器（或关系）
-    fired_points: Dict[int, float] = {}
-    for tg in triggers:
-        if tg.get("type") not in ACTIVE_TYPES:
-            continue
-        fired, fire_point = check_active_fire(tg, now_ts)
-        if fired:
-            fired_points[tg["id"]] = fire_point
+    # 只有当前 worker 等待的 deadline 才能产生主动触发，不扫描历史时间点。
+    fired_ids = set()
+    if active_fire_at is not None and math.isfinite(float(active_fire_at)):
+        for tg in triggers:
+            if tg.get("type") not in ACTIVE_TYPES:
+                continue
+            next_fire = _next_fire_strictly_after(tg, float(active_fire_at) - 1e-6)
+            if next_fire is not None and abs(next_fire - float(active_fire_at)) <= 1e-3:
+                fired_ids.add(tg["id"])
 
-    if not fired_points:
-        # 没有主动触发器到点，不触发；记录主动型 ToF 供调用方判断是否写日志
+    if not fired_ids:
         result["trigger_tof"] = {tg["id"]: False for tg in triggers if tg.get("type") in ACTIVE_TYPES}
         return result
 
     result["has_active_fire"] = True
-    result["fired_points"] = fired_points
 
-    # 构造 tof_map：主动型按"是否到点"取真值，被动型实时求值
+    # 构造 tof_map：主动型按本轮 deadline 是否属于该触发器，被动型实时求值
     tof_map: Dict[int, bool] = {}
     passives_ok = True
     for tg in triggers:
         tid = tg["id"]
         if tg.get("type") in ACTIVE_TYPES:
-            tof_map[tid] = fired_points.get(tid) is not None
+            tof_map[tid] = tid in fired_ids
         else:
             tof = passive_tof(tg, now_ts, task_last_success)
             tof_map[tid] = tof

@@ -35,9 +35,11 @@ class SchedulerRuntime:
             return {"state": "disabled"}
         return dict(self._states.get(task_id, {"state": "waiting"}))
 
-    def start(self):
+    async def start(self):
         if self._started or self._closed:
             return
+        # Startup only arms workers. Each worker computes a future deadline from
+        # the current wall clock; no historical trigger cursor is persisted.
         self._started = True
         for task_id in self.store.tasks:
             self.refresh(task_id)
@@ -85,8 +87,6 @@ class SchedulerRuntime:
             if trigger["id"] in ids:
                 raise ValueError("触发器 id 重复")
             ids.add(trigger["id"])
-            if not math.isfinite(float(trigger.get("last_fired", 0) or 0)):
-                raise ValueError("触发时间必须是有限数值")
         if not any(t["type"] in self.core.ACTIVE_TYPES for t in triggers):
             raise ValueError("任务至少需要一个主动触发器")
         if not math.isfinite(float(task.get("last_success_time", 0) or 0)):
@@ -101,19 +101,22 @@ class SchedulerRuntime:
         if str(content.get("text", "") or "").strip() and not task.get("target", "").strip():
             raise ValueError("请选择一个发送目标对话")
 
-    def _delay(self, task, now):
+    def _deadline(self, task, now):
+        """Returns (下一个未来触发点, 等待时长)。
+
+        deadline 只属于当前等待，不写回任务；每次重算都以当前墙钟为准。
+        等待时长按 poll_interval 封顶，以便定期校准系统时钟修正。
+        """
         self._validate(task)
-        if any(self.core.check_active_fire(t, now)[0] for t in task["triggers"]):
-            return 0.0
-        next_fire = self.core.next_trigger_preview(task["triggers"], now)
-        if next_fire is None or not math.isfinite(next_fire):
+        deadline = self.core.next_trigger_preview(task["triggers"], now)
+        if deadline is None or not math.isfinite(deadline):
             raise ValueError("无法计算下一次触发时间，请检查触发器配置")
         # Periodic clock recheck bounds the effect of wall-clock corrections.
         try:
             clock_check = max(2, min(3600, int(self.config.get("poll_interval", 600))))
         except (ValueError, TypeError):
             clock_check = 600
-        return max(0.05, min(next_fire - now + 0.05, float(clock_check)))
+        return deadline, max(0.05, min(deadline - now + 0.05, float(clock_check)))
 
     async def _wait(self, event, delay=None):
         if delay is None:
@@ -136,15 +139,21 @@ class SchedulerRuntime:
                     await self._wait(event)
                     continue
                 try:
-                    delay = self._delay(task, time.time())
+                    started_wait = time.time()
+                    deadline, delay = self._deadline(task, started_wait)
+                    raw_delay = deadline - started_wait + 0.05
                     if self._states.get(task_id, {}).get("state") != "running":
                         self._states[task_id] = {
                             "state": "waiting",
-                            "next_check": time.time() + delay,
+                            "next_check": started_wait + delay,
                         }
                     await self._wait(event, delay)
                     if event.is_set():
                         continue  # Definition changed: recompute, do not use a stale deadline.
+                    if raw_delay > delay + 1e-6:
+                        continue  # Periodic recheck after a clock change; never consume the old deadline.
+                    if time.time() < deadline:
+                        continue  # Clock recheck only: no trigger point has arrived yet.
                     async with self.lock(task_id):
                         task = self.store.tasks.get(task_id)
                         if task is None or not task.get("enabled", True):
@@ -152,7 +161,7 @@ class SchedulerRuntime:
                         if self._states.get(task_id, {}).get("state") == "faulted":
                             continue
                         try:
-                            await self._check(task_id, task)
+                            await self._check(task_id, task, deadline)
                         except Exception as exc:
                             await self._fault(task_id, exc)
                 except Exception as exc:
@@ -174,23 +183,15 @@ class SchedulerRuntime:
             # Keep a visible in-memory fault even if the disk is full. No retry loop.
             fault["error"] += f"；日志保存失败: {save_error}"
 
-    async def _check(self, task_id, task):
+    async def _check(self, task_id, task, active_fire_at=None):
         self._validate(task)
         now = time.time()
         result = self.core.evaluate_task(
-            task["triggers"], now, float(task.get("last_success_time", 0) or 0)
+            task["triggers"], now, float(task.get("last_success_time", 0) or 0), active_fire_at
         )
         if not result["has_active_fire"]:
-            # A pending trigger must either be consumed or fault; never zero-delay spin.
-            if any(self.core.check_active_fire(t, now)[0] for t in task["triggers"]):
-                raise RuntimeError("到点触发器未被处理")
+            # 当前 deadline 没有匹配的主动触发器时，等待下一轮重新计算。
             return
-        points = result["fired_points"]
-        if not points:
-            raise RuntimeError("到点触发器缺少触发时间")
-        for trigger in task["triggers"]:
-            if trigger["id"] in points:
-                trigger["last_fired"] = points[trigger["id"]]
         task["updated_at"] = now
         tof = result["trigger_tof"]
         if not result["should_run"]:

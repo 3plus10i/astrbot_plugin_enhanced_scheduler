@@ -139,6 +139,13 @@ class TaskStore:
                     content["holiday_aware"] = False
                 if content.get("system_prompt") == LEGACY_STANDALONE_SYSTEM_PROMPT:
                     content["system_prompt"] = ""
+        # 数据迁移：主动触发器不再保存 last_fired，旧字段仅兼容读取并清除。
+        for task in self.data.get("tasks", {}).values():
+            if not isinstance(task, dict):
+                continue
+            for trigger in task.get("triggers", []) if isinstance(task.get("triggers"), list) else []:
+                if isinstance(trigger, dict) and trigger.get("type") in self.core.ACTIVE_TYPES:
+                    trigger.pop("last_fired", None)
         # 数据迁移：旧版 interval 触发器无 base_time -> 补为创建日 0 点
         for task in self.data.get("tasks", {}).values():
             if not isinstance(task, dict):

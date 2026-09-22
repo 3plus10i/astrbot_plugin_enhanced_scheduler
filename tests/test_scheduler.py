@@ -11,7 +11,6 @@ import threading
 import time
 import types
 import unittest
-from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -81,15 +80,14 @@ executor_module = load("task_executor")
 main_module = load("main")
 
 
-def task(task_id="a", due=True):
-    now = time.time()
+def task(task_id="a"):
+    """A task whose single trigger fires on every whole minute, so all tasks share points."""
     return {
         "id": task_id, "name": task_id, "enabled": True, "target": "test:FriendMessage:" + task_id,
         "content": {"mode": "fixed", "text": "hello"}, "last_success_time": 0,
         "triggers": [{"id": 1, "type": "interval", "config": {
-            "base_time": datetime.fromtimestamp(now - 600).isoformat(timespec="seconds"),
-            "minutes": 1,
-        }, "last_fired": now - 120 if due else now}],
+            "base_time": "2026-01-01T00:00:00", "minutes": 1,
+        }}],
     }
 
 
@@ -97,6 +95,32 @@ async def until(predicate):
     async with asyncio.timeout(2):
         while not predicate():
             await asyncio.sleep(0.002)
+
+
+class Clock:
+    """The wall clock the runtime reads; shifted so a trigger point can be placed nearby.
+
+    Only wall-clock reads are shifted, asyncio still waits in real time: an armed
+    worker observes its trigger point arriving after a short real sleep.
+    """
+
+    def __init__(self):
+        self.offset = 0.0
+
+    def time(self):
+        return time.time() + self.offset
+
+    def idle(self):
+        """Sit 30s into a whole minute, so the next trigger point is never imminent."""
+        now = self.time()
+        self.offset += (now // 60 * 60 + 30) - now
+
+    def arm(self, triggers):
+        """Shift the clock to 0.05s before the next trigger point of these triggers."""
+        now = self.time()
+        point = core.next_trigger_preview(triggers, now)
+        if point is not None:
+            self.offset += (point - 0.05) - now
 
 
 class Executor:
@@ -127,22 +151,63 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.store = storage_module.TaskStore(self.directory.name, {}, core)
         self.executor = Executor()
         self.logger = Mock()
+        self.clock = Clock()
+        clock_patch = patch.object(runtime_module, "time", self.clock)
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
+        self.clock.idle()
         self.runtime = runtime_module.SchedulerRuntime(core, self.store, self.executor, {}, self.logger)
         self.addAsyncCleanup(self.runtime.close)
+
+    async def _start_armed(self, *task_ids):
+        """Start with the clock armed, so each listed task reaches its next point in ~0.1s."""
+        for task_id in task_ids or list(self.store.tasks):
+            self.clock.arm(self.store.tasks[task_id]["triggers"])
+        await self.runtime.start()
+
+    async def test_startup_arms_future_deadlines_without_mutating_tasks(self):
+        self.store.tasks.update(a=task("a"), b=task("b"), c=task("c"))
+        self.store.tasks["a"]["last_success_time"] = time.time() - 3600
+        previous = copy.deepcopy(self.store.tasks)
+        await self.runtime.start()
+        await until(lambda: all(self.runtime.status(key).get("next_check") for key in previous))
+        self.assertEqual(self.executor.calls, [])
+        self.assertEqual(self.store.run_logs, [])
+        self.assertEqual(self.store.tasks, previous)
+        await self.runtime.start()
+        self.assertEqual(self.store.tasks, previous)
+
+    async def test_next_future_fire_still_runs_after_startup(self):
+        self.store.tasks["a"] = task()
+        await self.runtime.start()
+        next_fire = core.next_trigger_preview(self.store.tasks["a"]["triggers"], time.time())
+        async with self.runtime.lock("a"):
+            with patch.object(runtime_module, "time", types.SimpleNamespace(time=lambda: next_fire + 0.01)):
+                await self.runtime._check("a", self.store.tasks["a"], next_fire)
+        self.assertEqual(len(self.executor.calls), 1)
+        self.assertNotIn("last_fired", self.store.tasks["a"]["triggers"][0])
+        self.assertEqual(self.store.run_logs[0]["action"], "send_fixed")
+
+    async def test_startup_does_not_persist_or_consume_a_trigger(self):
+        self.store.tasks["a"] = task()
+        previous = copy.deepcopy(self.store.tasks)
+        await self.runtime.start()
+        self.assertEqual(self.store.tasks, previous)
+        self.assertEqual(self.executor.calls, [])
 
     async def test_slow_task_does_not_block_another(self):
         self.store.tasks.update(a=task("a"), b=task("b"))
         self.executor.blocked["a"] = asyncio.Event()
-        self.runtime.start()
+        await self._start_armed()
+        await until(lambda: self.runtime.status("a")["state"] == "running")
         await until(lambda: any(log["task_id"] == "b" for log in self.store.run_logs))
-        self.assertEqual(self.runtime.status("a")["state"], "running")
         self.assertGreater(self.store.tasks["b"]["last_success_time"], 0)
 
     async def test_invalid_passive_faults_once_and_does_not_spin(self):
         bad = task("a")
         bad["triggers"].append({"id": 2, "type": "random", "config": {"threshold": 2}})
         self.store.tasks.update(a=bad, b=task("b"))
-        self.runtime.start()
+        await self._start_armed()
         await until(lambda: self.runtime.status("a")["state"] == "faulted" and len(self.executor.calls) == 1)
         for _ in range(5):
             self.runtime.wake_all()
@@ -153,18 +218,18 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_execution_exception_logged_and_not_retried(self):
         self.store.tasks["a"] = task()
         self.executor.errors.add("a")
-        self.runtime.start()
+        await self._start_armed()
         await until(lambda: self.runtime.status("a")["state"] == "faulted")
         self.runtime.wake_all()
         await asyncio.sleep(0.02)
         self.assertEqual(len(self.executor.calls), 1)
         self.assertEqual(self.store.run_logs[0]["action"], "failed")
-        self.assertFalse(core.check_active_fire(self.store.tasks["a"]["triggers"][0], time.time())[0])
+        self.assertNotIn("last_fired", self.store.tasks["a"]["triggers"][0])
 
     async def test_send_failure_consumes_occurrence_without_advancing_cooldown(self):
         self.store.tasks["a"] = task()
         self.executor.failures.add("a")
-        self.runtime.start()
+        await self._start_armed()
         await until(lambda: len(self.store.run_logs) == 1)
         self.runtime.wake_all()
         await asyncio.sleep(0.02)
@@ -176,7 +241,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         definition = task()
         definition["triggers"].append({"id": 2, "type": "random", "config": {"threshold": 0}})
         self.store.tasks["a"] = definition
-        self.runtime.start()
+        await self._start_armed()
         await until(lambda: len(self.store.run_logs) == 1)
         self.assertEqual(self.executor.calls, [])
         self.assertEqual(self.store.run_logs[0]["action"], "skipped")
@@ -185,12 +250,13 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_edit_wakes_only_its_task_and_recovers_fault(self):
         bad = task()
         bad["triggers"][0]["config"]["minutes"] = -1
-        self.store.tasks.update(a=bad, b=task("b", due=False))
-        self.runtime.start()
+        self.store.tasks.update(a=bad, b=task("b"))
+        await self.runtime.start()
         await until(lambda: self.runtime.status("a")["state"] == "faulted")
         other_worker = self.runtime._workers["b"]
         async with self.runtime.lock("a"):
             self.store.tasks["a"] = task()
+            self.clock.arm(self.store.tasks["a"]["triggers"])
             await self.store.save()
             self.runtime.refresh("a")
         await until(lambda: len(self.executor.calls) == 1)
@@ -200,16 +266,16 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_manual_and_automatic_cannot_overlap(self):
         self.store.tasks["a"] = task()
         self.executor.blocked["a"] = asyncio.Event()
-        self.runtime.start()
+        await self._start_armed()
         await until(lambda: len(self.executor.calls) == 1)
         with self.assertRaisesRegex(RuntimeError, "正在执行"):
             await self.runtime.trigger_now("a")
         self.assertEqual(len(self.executor.calls), 1)
 
     async def test_manual_duplicates_rejected_and_close_cancels_manual(self):
-        self.store.tasks["a"] = task(due=False)
+        self.store.tasks["a"] = task()
         self.executor.blocked["a"] = asyncio.Event()
-        self.runtime.start()
+        await self.runtime.start()
         manual = asyncio.create_task(self.runtime.trigger_now("a"))
         await until(lambda: len(self.executor.calls) == 1)
         with self.assertRaises(RuntimeError):
@@ -220,8 +286,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.runtime._workers)
 
     async def test_disabled_and_deleted_workers_stop(self):
-        self.store.tasks.update(a=task(due=False), b=task("b", due=False))
-        self.runtime.start()
+        self.store.tasks.update(a=task("a"), b=task("b"))
+        await self.runtime.start()
         workers = list(self.runtime._workers.values())
         async with self.runtime.lock("a"):
             self.store.tasks["a"]["enabled"] = False
@@ -235,7 +301,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_edit_waits_for_inflight_execution(self):
         self.store.tasks["a"] = task()
         gate = self.executor.blocked["a"] = asyncio.Event()
-        self.runtime.start()
+        await self._start_armed()
         await until(lambda: len(self.executor.calls) == 1)
         edited = asyncio.Event()
 
@@ -254,8 +320,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disk_failure_prevents_send_and_faults_without_log_flood(self):
         self.store.tasks["a"] = task()
+        await self._start_armed()
         self.store._write_json = Mock(side_effect=OSError("disk full"))
-        self.runtime.start()
         await until(lambda: self.runtime.status("a")["state"] == "faulted")
         await asyncio.sleep(0.02)
         self.assertEqual(self.executor.calls, [])
@@ -265,40 +331,52 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_trigger_is_persisted_before_sending(self):
         self.store.tasks["a"] = task()
         self.executor.blocked["a"] = asyncio.Event()
-        self.runtime.start()
+        await self._start_armed()
         await until(lambda: len(self.executor.calls) == 1)
         saved = json.loads(Path(self.store.data_file).read_text(encoding="utf-8"))
-        self.assertFalse(core.check_active_fire(saved["tasks"]["a"]["triggers"][0], time.time())[0])
+        self.assertNotIn("last_fired", saved["tasks"]["a"]["triggers"][0])
 
     async def test_migrated_task_cannot_be_manually_sent_before_edit(self):
         definition = task()
         definition.update(enabled=False, migration_notice="请重新配置")
         self.store.tasks["a"] = definition
-        self.runtime.start()
+        await self.runtime.start()
         with self.assertRaisesRegex(ValueError, "先编辑"):
             await self.runtime.trigger_now("a")
         self.assertEqual(self.executor.calls, [])
 
     async def test_manual_fault_stops_automatic_wait_until_edit(self):
-        self.store.tasks["a"] = task(due=False)
+        self.store.tasks["a"] = task()
         self.executor.errors.add("a")
-        self.runtime.start()
+        await self.runtime.start()
         await asyncio.sleep(0.01)
         with self.assertRaises(TypeError):
             await self.runtime.trigger_now("a")
         self.assertEqual(self.store.run_logs[-1]["source"], "manual")
-        self.store.tasks["a"]["triggers"][0]["last_fired"] -= 120
+        # A faulted task stays parked even when its trigger point arrives.
+        self.clock.arm(self.store.tasks["a"]["triggers"])
         self.runtime.wake_all()
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.05)
         self.assertEqual(len(self.executor.calls), 1)
         self.assertEqual(self.runtime.status("a")["state"], "faulted")
+
+    async def test_refresh_recomputes_from_current_wall_clock_without_cursor(self):
+        self.store.tasks["a"] = task()
+        await self.runtime.start()
+        self.runtime.refresh("a")
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.executor.calls, [])
+        self.clock.arm(self.store.tasks["a"]["triggers"])
+        self.runtime.refresh("a")
+        await until(lambda: len(self.executor.calls) == 1)
+        self.assertNotIn("last_fired", self.store.tasks["a"]["triggers"][0])
 
     async def test_success_time_uses_completion_time(self):
         self.store.tasks["a"] = task()
         gate = self.executor.blocked["a"] = asyncio.Event()
-        self.runtime.start()
+        await self._start_armed()
         await until(lambda: len(self.executor.calls) == 1)
-        completed_after = time.time()
+        completed_after = self.clock.time()
         gate.set()
         await until(lambda: self.store.tasks["a"]["last_success_time"] > 0)
         self.assertGreaterEqual(self.store.tasks["a"]["last_success_time"], completed_after)
@@ -548,10 +626,10 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin.store.tasks, {})
 
     async def test_saving_migrated_task_clears_notice(self):
-        old = task(due=False)
+        old = task()
         old.update(enabled=False, migration_notice="需要重新配置")
         self.plugin.store.tasks["a"] = old
-        self.request.body = task(due=False)
+        self.request.body = task()
         result = await self.plugin._api_upsert_task()
         self.assertEqual(result["status"], "success")
         self.assertNotIn("migration_notice", self.plugin.store.tasks["a"])

@@ -28,7 +28,7 @@ SchedulerRuntime = _load_local("scheduler_runtime").SchedulerRuntime
 PLUGIN_NAME = "astrbot_plugin_enhanced_scheduler"
 
 
-@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，主动取或、被动取且的多触发器组合。", "1.4.0")
+@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，主动取或、被动取且的多触发器组合。", "1.4.1")
 class EnhancedSchedulerPlugin(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):
         super().__init__(context)
@@ -39,9 +39,8 @@ class EnhancedSchedulerPlugin(Star):
         self._register_web_apis()
 
     async def initialize(self):
-        await self.store.save()
-        self.runtime.start()
-        logger.info("[EnhancedScheduler] 已启动（每任务独立等待）")
+        await self.runtime.start()
+        logger.info("[EnhancedScheduler] 已启动（每任务独立等待下一个未来触发点，不补发历史触发点）")
 
     async def terminate(self):
         await self.runtime.close()
@@ -180,23 +179,9 @@ class EnhancedSchedulerPlugin(Star):
         triggers = req.get("triggers", [])
         if not isinstance(triggers, list) or not triggers:
             return False, "至少需要一个触发器", ""
-        # 规范化并校验每个触发器
-        # 更新任务时继承原触发器的 last_fired（避免重置导致立即重复触发）；
-        # 新建任务或新增触发器 id 时用当前时间作为 last_fired，使首次触发从未来第一个点开始。
+        # 规范化并校验每个触发器。主动触发器不保存历史执行记录，
+        # 下次触发点始终从当前墙钟和配置计算。
         is_update = bool(task_id) and task_id in tasks
-        existing_lf = {}
-        if is_update:
-            old_triggers = tasks[task_id].get("triggers", [])
-            for et in old_triggers if isinstance(old_triggers, list) else []:
-                if not isinstance(et, dict):
-                    continue
-                eid = et.get("id")
-                if eid is not None:
-                    try:
-                        value = float(et.get("last_fired", 0.0) or 0.0)
-                        existing_lf[eid] = value if math.isfinite(value) else time.time()
-                    except (ValueError, TypeError):
-                        existing_lf[eid] = time.time()
         now = time.time()
         norm_triggers = []
         seen_ids = set()
@@ -209,10 +194,6 @@ class EnhancedSchedulerPlugin(Star):
             if tid in seen_ids:
                 return False, f"触发器 id {tid} 重复", ""
             seen_ids.add(tid)
-            if tid in existing_lf:
-                lf = existing_lf[tid]
-            else:
-                lf = now
             if not isinstance(tg.get("config", {}), dict):
                 return False, f"触发器 {tid}: config 必须是对象", ""
             cfg = dict(tg.get("config", {}))
@@ -223,7 +204,6 @@ class EnhancedSchedulerPlugin(Star):
                 "id": tid,
                 "type": tg.get("type"),
                 "config": cfg,
-                "last_fired": lf,
             }
             ok, msg = core.validate_trigger(norm_tg)
             if not ok:
@@ -339,7 +319,8 @@ class EnhancedSchedulerPlugin(Star):
             task.update(id=new_id, name=task.get("name", "") + " (副本)", enabled=False,
                         created_at=now, updated_at=now, last_success_time=0.0)
             for trigger in task.get("triggers", []):
-                trigger["last_fired"] = now
+                if isinstance(trigger, dict) and trigger.get("type") in core.ACTIVE_TYPES:
+                    trigger.pop("last_fired", None)
             self.store.tasks[new_id] = task
             try:
                 await self.store.save(include_logs=False)
@@ -396,7 +377,6 @@ class EnhancedSchedulerPlugin(Star):
                         "id": tg.get("id"),
                         "type": tg.get("type"),
                         "config": tg.get("config", {}),
-                        "last_fired": float(tg.get("last_fired", 0.0) or 0.0),
                     })
             now = time.time()
             nf = core.next_trigger_preview(norm_triggers, now)
