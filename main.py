@@ -28,14 +28,14 @@ SchedulerRuntime = _load_local("scheduler_runtime").SchedulerRuntime
 PLUGIN_NAME = "astrbot_plugin_enhanced_scheduler"
 
 
-@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，主动取或、被动取且的多触发器组合。", "1.4.1")
+@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，主动取或、被动取且的多触发器组合。", "1.4.2")
 class EnhancedSchedulerPlugin(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):
         super().__init__(context)
         self.config = config if config is not None else {}
         self.store = TaskStore(str(StarTools.get_data_dir(PLUGIN_NAME)), self.config, core)
         self.executor = TaskExecutor(context, self.config, core, self.store)
-        self.runtime = SchedulerRuntime(core, self.store, self.executor, self.config, logger)
+        self.runtime = SchedulerRuntime(core, self.store, self.executor, logger)
         self._register_web_apis()
 
     async def initialize(self):

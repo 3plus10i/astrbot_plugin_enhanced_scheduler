@@ -6,11 +6,10 @@ import time
 
 
 class SchedulerRuntime:
-    def __init__(self, core, store, executor, config, logger):
+    def __init__(self, core, store, executor, logger):
         self.core = core
         self.store = store
         self.executor = executor
-        self.config = config
         self.logger = logger
         self._workers = {}
         self._events = {}
@@ -102,21 +101,12 @@ class SchedulerRuntime:
             raise ValueError("请选择一个发送目标对话")
 
     def _deadline(self, task, now):
-        """Returns (下一个未来触发点, 等待时长)。
-
-        deadline 只属于当前等待，不写回任务；每次重算都以当前墙钟为准。
-        等待时长按 poll_interval 封顶，以便定期校准系统时钟修正。
-        """
+        """Returns (下一个未来触发点, 等待时长)。"""
         self._validate(task)
         deadline = self.core.next_trigger_preview(task["triggers"], now)
         if deadline is None or not math.isfinite(deadline):
             raise ValueError("无法计算下一次触发时间，请检查触发器配置")
-        # Periodic clock recheck bounds the effect of wall-clock corrections.
-        try:
-            clock_check = max(2, min(3600, int(self.config.get("poll_interval", 600))))
-        except (ValueError, TypeError):
-            clock_check = 600
-        return deadline, max(0.05, min(deadline - now + 0.05, float(clock_check)))
+        return deadline, max(0.05, deadline - now + 0.05)
 
     async def _wait(self, event, delay=None):
         if delay is None:
@@ -141,7 +131,6 @@ class SchedulerRuntime:
                 try:
                     started_wait = time.time()
                     deadline, delay = self._deadline(task, started_wait)
-                    raw_delay = deadline - started_wait + 0.05
                     if self._states.get(task_id, {}).get("state") != "running":
                         self._states[task_id] = {
                             "state": "waiting",
@@ -150,10 +139,6 @@ class SchedulerRuntime:
                     await self._wait(event, delay)
                     if event.is_set():
                         continue  # Definition changed: recompute, do not use a stale deadline.
-                    if raw_delay > delay + 1e-6:
-                        continue  # Periodic recheck after a clock change; never consume the old deadline.
-                    if time.time() < deadline:
-                        continue  # Clock recheck only: no trigger point has arrived yet.
                     async with self.lock(task_id):
                         task = self.store.tasks.get(task_id)
                         if task is None or not task.get("enabled", True):

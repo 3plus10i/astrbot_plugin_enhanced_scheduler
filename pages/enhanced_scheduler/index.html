@@ -12,7 +12,7 @@
             <div class="header-left">
                 <span class="back-btn" id="back-btn">← 返回</span>
                 <h1 class="page-title">增强计划任务</h1>
-                <span class="plugin-version">v1.4.1</span>
+                <span class="plugin-version">v1.4.2</span>
             </div>
             <div class="header-right">
                 <div class="tab-nav">
@@ -110,11 +110,6 @@
                     <div class="card">
                         <div class="card-header"><div class="card-header-title-group"><h2 class="card-title">基础配置</h2></div></div>
                         <div class="card-body">
-                            <div class="form-group">
-                                <label class="form-label">最长等待复查间隔(秒)</label>
-                                <input type="number" class="form-input" id="config-poll-interval" min="2" max="3600" required>
-                                <span class="form-hint">每个正常启用的任务最多等待此时长，就醒来检查自己的主动触发器是否到点。没到点则继续等待，不检查被动条件、不调用 AI、不发送消息。触发点更近时会提前醒来，编辑任务也会立即唤醒。用于适应系统时间调整，不改变任务执行周期。默认 600 秒（10 分钟）。</span>
-                            </div>
                             <div class="form-group">
                                 <label class="form-label">日志保留条数</label>
                                 <input type="number" class="form-input" id="config-log-retention" min="10" max="5000" required>

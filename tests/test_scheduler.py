@@ -156,7 +156,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         clock_patch.start()
         self.addCleanup(clock_patch.stop)
         self.clock.idle()
-        self.runtime = runtime_module.SchedulerRuntime(core, self.store, self.executor, {}, self.logger)
+        self.runtime = runtime_module.SchedulerRuntime(core, self.store, self.executor, self.logger)
         self.addAsyncCleanup(self.runtime.close)
 
     async def _start_armed(self, *task_ids):

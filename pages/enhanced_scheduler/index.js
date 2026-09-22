@@ -190,7 +190,7 @@ async function init() {
     }
 
     function renderConfig(cfg) {
-        $("config-poll-interval").value = cfg.poll_interval != null ? cfg.poll_interval : 600;
+
         $("config-log-retention").value = cfg.log_retention != null ? cfg.log_retention : 100;
         $("config-llm-timeout").value = cfg.llm_timeout != null ? cfg.llm_timeout : 60;
         $("config-llm-log-retention").value = cfg.llm_log_retention != null ? cfg.llm_log_retention : 10;
@@ -1155,7 +1155,6 @@ async function init() {
     $("config-form").addEventListener("submit", async e => {
         e.preventDefault();
         const payload = {
-            poll_interval: parseInt($("config-poll-interval").value) || 600,
             log_retention: parseInt($("config-log-retention").value) || 100,
             llm_timeout: parseInt($("config-llm-timeout").value) || 60,
             llm_log_retention: parseInt($("config-llm-log-retention").value) || 500,
