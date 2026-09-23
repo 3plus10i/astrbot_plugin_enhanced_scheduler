@@ -26,6 +26,7 @@ SCHEDULED_PROMPT_NO_TIME = "<scheduled_task>这是由计划任务自动触发的
 # 用 https：http 会被 302 到 https，多一次握手且实测更慢/更易超时
 # 该接口对空 User-Agent 返回 403，必须带上浏览器风格 UA
 HOLIDAY_API_URL = "https://timor.tech/api/holiday/info/"
+HOLIDAY_API_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 class TaskExecutor:
     def __init__(self, context, config, core, store):

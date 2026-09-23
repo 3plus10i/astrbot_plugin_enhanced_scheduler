@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 import math
 import random as _random
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, List, Any
 
 # croniter 仅在 cron 触发器中使用；若未安装则 cron 功能不可用但不影响其它类型
@@ -47,6 +47,9 @@ T_COOLDOWN = "cooldown"
 ACTIVE_TYPES = (T_INTERVAL, T_CRON)      # 主动型：自己到点触发（多个之间取"或"）
 PASSIVE_TYPES = (T_WINDOW, T_RANDOM, T_COOLDOWN)  # 被动型：被主动型唤起后求值（多个之间取"且"）
 ALL_TYPES = ACTIVE_TYPES + PASSIVE_TYPES
+
+# 下次触发时刻推进上限：每次推进都跨过一个未开启区间，正常几步内收敛
+_PREVIEW_MAX_STEPS = 64
 
 
 def _ts(dt: datetime) -> float:
@@ -230,27 +233,93 @@ def _next_fire_strictly_after(trigger: Dict[str, Any], after_ts: float) -> Optio
     return None
 
 
-def next_trigger_preview(triggers: List[Dict[str, Any]], now_ts: float) -> Optional[float]:
-    """
-    计算所有主动触发器中、基于 now_ts 的最近未来触发点，供页面预览。
-    仅考虑主动触发器；被动触发器无法预测，故不参与。
-    返回时间戳；若无主动触发器或无未来触发点返回 None。
-    """
-    best: Optional[float] = None
-    for tg in triggers:
-        if tg.get("type") not in ACTIVE_TYPES:
+def _cooldown_ready_ts(cfg: Dict[str, Any], task_last_success: float) -> float:
+    """冷却型最早可触发时刻 = 上次成功时间 + 冷却时长（冷却为 0 时视为已就绪）。"""
+    cooldown = int(cfg.get("hours", 0) or 0) * 3600 + int(cfg.get("minutes", 0) or 0) * 60
+    if cooldown <= 0:
+        return 0.0
+    return float(task_last_success or 0.0) + cooldown
+
+
+def _next_window_open(cfg: Dict[str, Any], after_ts: float) -> Optional[float]:
+    """返回严格晚于 after_ts 的下一个区间开启时刻；weekdays 限制下无可行日返回 None。"""
+    start = cfg.get("start")
+    if not _is_valid_hhmm(start):
+        return None
+    sh, sm = map(int, str(start).split(":"))
+    weekdays = cfg.get("weekdays")
+    day = _dt(after_ts)
+    for _ in range(8):  # 一周内任意 weekday 组合，最多向后 8 天必覆盖
+        if not weekdays or day.weekday() in weekdays:
+            open_ts = day.replace(hour=sh, minute=sm, second=0, microsecond=0).timestamp()
+            if open_ts > after_ts:
+                return open_ts
+        day += timedelta(days=1)
+    return None
+
+
+def _windows_all_open(windows: List[Dict[str, Any]], ts: float) -> bool:
+    """所有区间触发器在 ts 时刻是否都已开启（无区间触发器视为已开启）。"""
+    return all(_window_tof(tg.get("config", {}) or {}, ts) for tg in windows)
+
+
+def _advance_window_cursor(windows: List[Dict[str, Any]], ts: float) -> Optional[float]:
+    """把游标推进到「最早可能让所有区间同时开启」的时刻；无可行时刻返回 None。"""
+    candidates = []
+    for tg in windows:
+        cfg = tg.get("config", {}) or {}
+        if _window_tof(cfg, ts):
             continue
-        nf = _next_fire_strictly_after(tg, now_ts)
-        if nf is not None and nf > now_ts:
-            if best is None or nf < best:
-                best = nf
-    return best
+        nxt = _next_window_open(cfg, ts)
+        if nxt is None:
+            return None
+        candidates.append(nxt)
+    return max(candidates) if candidates else None
+
+
+def next_trigger_preview(triggers: List[Dict[str, Any]],
+                         now_ts: float,
+                         task_last_success: float = 0.0) -> Optional[float]:
+    """
+    计算触发器组的下一次真正触发时刻（严格晚于 now_ts）。
+
+    五类触发器里只有随机型不可预测；interval / cron / window / cooldown 均可稳定
+    推算未来时刻，因此这里把非随机被动约束一并纳入：返回「任一主动触发器到点」
+    且「所有区间已开启、所有冷却已到期」的最早时刻。随机型不参与计算。
+    无主动触发器、或约束无解（如多个区间交集为空）返回 None。
+    """
+    actives = [tg for tg in triggers if tg.get("type") in ACTIVE_TYPES]
+    if not actives:
+        return None
+    windows = [tg for tg in triggers if tg.get("type") == T_WINDOW]
+
+    # 冷却约束：所有 cooldown 都到期才是可行下界（+1e-6 保证结果严格晚于 now_ts）
+    cursor = now_ts + 1e-6
+    for tg in triggers:
+        if tg.get("type") == T_COOLDOWN:
+            cursor = max(cursor, _cooldown_ready_ts(tg.get("config", {}) or {}, task_last_success))
+
+    for _ in range(_PREVIEW_MAX_STEPS):
+        point = None
+        for tg in actives:
+            nf = _next_fire_strictly_after(tg, cursor - 1e-6)
+            if nf is not None and (point is None or nf < point):
+                point = nf
+        if point is None:
+            return None
+        if _windows_all_open(windows, point):
+            return point
+        nxt = _advance_window_cursor(windows, point)
+        if nxt is None or nxt <= cursor:
+            return None
+        cursor = nxt
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 未来触发时刻预览
-# 只有主动型触发器（interval / cron）能预测未来触发时刻；逐个复用
-# _next_fire_strictly_after 推进，避免与调度主循环的计算逻辑漂移。
+# 单个触发器的未来触发点预览
+# 逐个复用 _next_fire_strictly_after 推进，避免与调度主循环的计算逻辑漂移。
+# 仅主动型（interval / cron）有「触发点」概念，故只对其求值。
 # ─────────────────────────────────────────────────────────────────────
 
 def future_fires(trigger: Dict[str, Any], now_ts: float, count: int = 3) -> List[float]:

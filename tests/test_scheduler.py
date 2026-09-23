@@ -11,6 +11,7 @@ import threading
 import time
 import types
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -143,6 +144,51 @@ class Executor:
         }, "result", success
 
 
+class PreviewTests(unittest.TestCase):
+    """The preview must fold deterministic passive constraints (window/cooldown) in."""
+
+    @staticmethod
+    def at(month, day, hour, minute):
+        return datetime(2026, month, day, hour, minute).timestamp()
+
+    def interval(self, minutes, base="2026-01-01T00:00:00"):
+        return {"id": 1, "type": "interval", "config": {"base_time": base, "minutes": minutes}}
+
+    def test_window_defers_preview_to_next_open(self):
+        # 2026-01-01 is a Thursday; a per-minute trigger idle at 02:00 waits until 08:00.
+        triggers = [self.interval(1), {"id": 2, "type": "window", "config": {"start": "08:00", "end": "20:00"}}]
+        self.assertAlmostEqual(core.next_trigger_preview(triggers, self.at(1, 1, 2, 0)), self.at(1, 1, 8, 0), delta=0.001)
+
+    def test_window_weekdays_delay_to_matching_day(self):
+        triggers = [
+            self.interval(30),
+            {"id": 2, "type": "window", "config": {"start": "08:00", "end": "09:00", "weekdays": [0]}},
+        ]
+        self.assertAlmostEqual(core.next_trigger_preview(triggers, self.at(1, 1, 2, 0)), self.at(1, 5, 8, 0), delta=0.001)
+
+    def test_cooldown_waits_until_last_success_plus_window(self):
+        now = self.at(1, 1, 2, 0)
+        triggers = [self.interval(1), {"id": 2, "type": "cooldown", "config": {"hours": 2}}]
+        self.assertAlmostEqual(core.next_trigger_preview(triggers, now, now), self.at(1, 1, 4, 0), delta=0.001)
+
+    def test_random_trigger_does_not_delay_preview(self):
+        triggers = [self.interval(5), {"id": 2, "type": "random", "config": {"threshold": 0.5}}]
+        self.assertAlmostEqual(core.next_trigger_preview(triggers, self.at(1, 1, 2, 0)), self.at(1, 1, 2, 5), delta=0.001)
+
+    def test_result_is_strictly_after_now(self):
+        triggers = [self.interval(1)]
+        now = self.at(1, 1, 2, 0)
+        self.assertGreater(core.next_trigger_preview(triggers, now), now)
+
+    def test_disjoint_windows_have_no_preview(self):
+        triggers = [
+            self.interval(1),
+            {"id": 2, "type": "window", "config": {"start": "22:00", "end": "06:00"}},
+            {"id": 3, "type": "window", "config": {"start": "08:00", "end": "20:00"}},
+        ]
+        self.assertIsNone(core.next_trigger_preview(triggers, self.at(1, 1, 9, 0)))
+
+
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = TestDirectory()
@@ -246,6 +292,19 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.executor.calls, [])
         self.assertEqual(self.store.run_logs[0]["action"], "skipped")
         self.assertEqual(definition["last_success_time"], 0)
+
+    async def test_cooldown_defers_worker_instead_of_logging_skips(self):
+        definition = task("a")
+        definition["last_success_time"] = self.clock.time()
+        definition["triggers"].append({"id": 2, "type": "cooldown", "config": {"minutes": 10}})
+        self.store.tasks["a"] = definition
+        # Arm the clock right before the next interval point; the cooldown still holds,
+        # so the worker must sleep through it instead of writing skipped logs every minute.
+        self.clock.arm([definition["triggers"][0]])
+        await self.runtime.start()
+        await asyncio.sleep(0.2)
+        self.assertEqual(self.executor.calls, [])
+        self.assertEqual(self.store.run_logs, [])
 
     async def test_edit_wakes_only_its_task_and_recovers_fault(self):
         bad = task()

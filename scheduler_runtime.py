@@ -101,9 +101,15 @@ class SchedulerRuntime:
             raise ValueError("请选择一个发送目标对话")
 
     def _deadline(self, task, now):
-        """Returns (下一个未来触发点, 等待时长)。"""
+        """Returns (下一个未来触发点, 等待时长)。
+
+        非随机被动约束（区间/冷却）一并纳入：区间未开启或冷却未到期时直接等到
+        可触发时刻，避免短周期主动触发器在未激活区间反复空转并写大量跳过日志。
+        """
         self._validate(task)
-        deadline = self.core.next_trigger_preview(task["triggers"], now)
+        deadline = self.core.next_trigger_preview(
+            task["triggers"], now, float(task.get("last_success_time", 0) or 0)
+        )
         if deadline is None or not math.isfinite(deadline):
             raise ValueError("无法计算下一次触发时间，请检查触发器配置")
         return deadline, max(0.05, deadline - now + 0.05)

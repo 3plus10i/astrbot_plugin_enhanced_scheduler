@@ -1,7 +1,7 @@
 name: astrbot_plugin_enhanced_scheduler
 display_name: "增强计划任务"
 desc: "未来计划任务调度器。支持周期/cron/区间/随机/冷却多种触发器组合，实现复杂触发条件。可执行AI消息发送或文本发送。"
-version: "1.4.2"
+version: "1.4.3"
 author: "3plus10i"
 repo: "https://github.com/3plus10i/astrbot_plugin_enhanced_scheduler"
 astrbot_version: ">=4.27.0"

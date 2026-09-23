@@ -28,7 +28,7 @@ SchedulerRuntime = _load_local("scheduler_runtime").SchedulerRuntime
 PLUGIN_NAME = "astrbot_plugin_enhanced_scheduler"
 
 
-@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，主动取或、被动取且的多触发器组合。", "1.4.2")
+@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，主动取或、被动取且的多触发器组合。", "1.4.3")
 class EnhancedSchedulerPlugin(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):
         super().__init__(context)
@@ -80,7 +80,9 @@ class EnhancedSchedulerPlugin(Star):
             t_copy["_runtime"] = self.runtime.status(tid)
             try:
                 t_copy["_next_fire"] = (
-                    core.next_trigger_preview(t.get("triggers", []), now)
+                    core.next_trigger_preview(
+                        t.get("triggers", []), now, float(t.get("last_success_time", 0) or 0)
+                    )
                     if t_copy["_runtime"]["state"] in ("waiting", "running") else None
                 )
             except Exception:
