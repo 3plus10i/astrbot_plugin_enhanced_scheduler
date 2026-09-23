@@ -29,16 +29,6 @@ async function init() {
         const p = n => String(n).padStart(2, "0");
         return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
     }
-    // 脱敏 UMO 末尾数字串（QQ/群号）：保留前3后2，中间打码
-    // 神经病
-    function maskUmo(umo) {
-        return String(umo).replace(/(\d+)$/, (m) => {
-            // if (m.length <= 4) return m;
-            // const keep = Math.min(3, Math.floor(m.length / 2));
-            // return m.slice(0, keep) + "*".repeat(m.length - keep - 2) + m.slice(-2);
-            return m;
-        });
-    }
     // 当前自然日 0 点，格式化为 datetime-local 所需 YYYY-MM-DDTHH:MM
     function defaultBaseTime() {
         const d = new Date();
@@ -121,7 +111,7 @@ async function init() {
                     <td class="cell-wrap">${trigSummary || '—'}</td>
                     <td>${nf ? fmtTs(nf) : '—'}</td>
                     <td>${contentBadge}</td>
-                    <td class="cell-wrap">${escapeHtml(maskUmo(t.target || "—"))}</td>
+                    <td class="cell-wrap">${escapeHtml(t.target || "—")}</td>
                     <td><div class="actions-cell">
                         <button class="btn btn-edit edit-task-btn" data-id="${escapeHtml(k)}">编辑</button>
                         <button class="btn btn-secondary btn-sm copy-task-btn" data-id="${escapeHtml(k)}">复制</button>
@@ -162,7 +152,7 @@ async function init() {
             const detail = l.detail || "";
             // Old run logs remain readable; new records have a single target_result.
             const results = l.target_result ? [l.target_result] : (l.targets_result || []);
-            const targetInfo = results.map(tr => `${maskUmo(tr.umo)}:${tr.ok ? '✓' : '✗' + (tr.error || '')}`).join(" ");
+            const targetInfo = results.map(tr => `${tr.umo}:${tr.ok ? '✓' : '✗' + (tr.error || '')}`).join(" ");
             return `<tr>
                 <td>${fmtTs(l.time)}</td>
                 <td class="cell-wrap">${escapeHtml(l.task_name)}</td>
