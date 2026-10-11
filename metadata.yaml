@@ -8,6 +8,8 @@ astrbot_version: ">=4.27.0"
 support_platforms:
   - aiocqhttp
 tags: 
-  - 定时任务
   - 主动消息
-  - 随机性
+  - 拟人
+  - 定时回复
+  - 未来任务
+  - 随机回复
