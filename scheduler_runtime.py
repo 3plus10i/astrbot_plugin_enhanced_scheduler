@@ -28,8 +28,6 @@ class SchedulerRuntime:
         task = self.store.tasks.get(task_id, {})
         if not isinstance(task, dict):
             return {"state": "faulted", "error": "任务格式错误"}
-        if task.get("migration_notice"):
-            return {"state": "needs_configuration", "error": task["migration_notice"]}
         if not task.get("enabled", True):
             return {"state": "disabled"}
         return dict(self._states.get(task_id, {"state": "waiting"}))
@@ -75,6 +73,8 @@ class SchedulerRuntime:
         self._retired.clear()
 
     def _validate(self, task):
+        if not self.core.is_current_task_format(task):
+            raise ValueError("不再支持旧任务格式，请重新创建任务")
         triggers = task.get("triggers")
         if not isinstance(triggers, list) or not triggers:
             raise ValueError("任务至少需要一个主动触发器")
@@ -212,8 +212,6 @@ class SchedulerRuntime:
     async def _manual_run(self, task_id):
         async with self.lock(task_id):
             task = self.store.tasks[task_id]
-            if task.get("migration_notice"):
-                raise ValueError("请先编辑保存迁移后的单目标任务")
             self._validate(task)
             try:
                 return await self._execute(task_id, task, time.time(), {}, "manual")

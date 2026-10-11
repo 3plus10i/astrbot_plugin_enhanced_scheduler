@@ -52,6 +52,29 @@ ALL_TYPES = ACTIVE_TYPES + PASSIVE_TYPES
 _PREVIEW_MAX_STEPS = 64
 
 
+def is_current_task_format(task: Any) -> bool:
+    """Accept current task structure only; never infer or migrate old definitions."""
+    if not isinstance(task, dict) or not isinstance(task.get("target"), str):
+        return False
+    if any(key in task for key in ("targets", "logic_expr", "migration_notice", "invalid_data")):
+        return False
+    content = task.get("content")
+    if not isinstance(content, dict) or "use_llm" in content or content.get("mode") not in ("fixed", "standalone", "conversation"):
+        return False
+    triggers = task.get("triggers")
+    if not isinstance(triggers, list):
+        return False
+    for trigger in triggers:
+        if not isinstance(trigger, dict) or "last_fired" in trigger:
+            return False
+        cfg = trigger.get("config")
+        if not isinstance(cfg, dict):
+            return False
+        if trigger.get("type") == T_INTERVAL and not str(cfg.get("base_time", "")).strip():
+            return False
+    return True
+
+
 def _ts(dt: datetime) -> float:
     """datetime -> 本地时间戳"""
     return dt.timestamp()

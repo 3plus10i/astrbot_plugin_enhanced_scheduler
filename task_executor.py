@@ -485,15 +485,10 @@ VALID_MODES = (MODE_FIXED, MODE_STANDALONE, MODE_CONVERSATION)
 
 
 def _resolve_mode(content) -> str:
-    """解析任务内容的执行模式。兼容旧版 use_llm(bool) 字段。"""
-    if not isinstance(content, dict):
-        return MODE_FIXED
-    mode = content.get("mode")
-    if mode in VALID_MODES:
-        return mode
-    if content.get("use_llm"):
-        return MODE_CONVERSATION
-    return MODE_FIXED
+    """Read the explicit execution mode of a current task."""
+    if not isinstance(content, dict) or content.get("mode") not in VALID_MODES:
+        raise ValueError("任务执行模式错误")
+    return content["mode"]
 
 
 def _format_holiday_desc(data) -> str:

@@ -8,6 +8,7 @@ async function init() {
     let validateTimer = null;
     let validateRevision = 0;
     let savedConfig = null;
+    let taskNameMaxLength = null; // Defined once by the backend and shared through get_data.
     const LOGS_PAGE_SIZE = 20;
     let logsPage = 0;
 
@@ -67,6 +68,11 @@ async function init() {
         try {
             const res = await bridge.apiGet("get_data", {});
             if (!res || res.status !== "success") { showToast("获取数据失败", true); return; }
+            const limit = res.limits && res.limits.task_name_max_length;
+            if (!Number.isInteger(limit) || limit <= 0) throw new Error("任务名称长度限制未加载，请重载插件后刷新页面");
+            taskNameMaxLength = limit;
+            $("task-name").maxLength = taskNameMaxLength;
+            $("add-task-btn").disabled = false;
             allTasks = res.tasks || {};
             renderTasks();
             renderConfig(res.config || {});
@@ -96,13 +102,13 @@ async function init() {
             const labels = {interval: "周期", cron: "cron", random: "随机", window: "区间", cooldown: "冷却"};
             const trigSummary = [...new Set(trgList.map(tr => labels[tr.type] || tr.type))].map(escapeHtml).join("，");
             const ct = t.content || {};
-            const mode = ct.mode || (ct.use_llm ? "conversation" : "fixed");
+            const mode = ct.mode;
             const hasText = !!(ct.text && String(ct.text).trim());
             const modeCN = {fixed:"固定文本", standalone:"独立 AI", conversation:"对话 AI"}[mode] || mode;
             const nf = t._next_fire;
             const runtime = t._runtime || {};
-            const stateText = {waiting:"就绪", running:"执行中", faulted:"调度故障", disabled:"已停用", needs_configuration:"需要重新配置"}[runtime.state] || (t.enabled ? "就绪" : "已停用");
-            const stateClass = {faulted:"badge-failed", needs_configuration:"badge-warning", running:"badge-running"}[runtime.state] || (t.enabled ? "badge-active" : "badge-inactive");
+            const stateText = {waiting:"就绪", running:"执行中", faulted:"调度故障", disabled:"已停用"}[runtime.state] || (t.enabled ? "就绪" : "已停用");
+            const stateClass = {faulted:"badge-failed", running:"badge-running"}[runtime.state] || (t.enabled ? "badge-active" : "badge-inactive");
             return `
                 <tr>
                     <td><button type="button" class="task-name edit-task-btn" data-id="${escapeHtml(k)}">${escapeHtml(t.name)}</button><div class="cell-secondary task-target" title="${escapeHtml(t.target || '')}">${escapeHtml(t.target || "未指定发送对象")}</div></td>
@@ -153,8 +159,7 @@ async function init() {
             const actionCN = {send_llm:"AI 发送",send_fixed:"发送文本",noop:"空动作",partial:"部分失败",skipped:"跳过",failed:"失败"}[l.action] || l.action;
             const actionBadge = ["skipped", "noop"].includes(l.action) ? "badge-skipped" : (l.action === "failed" || l.action === "partial" ? "badge-failed" : "badge-active");
             const detail = l.detail || "";
-            // Old run logs remain readable; new records have a single target_result.
-            const results = l.target_result ? [l.target_result] : (l.targets_result || []);
+            const results = l.target_result ? [l.target_result] : [];
             const targetInfo = results.map(tr => `发送对象：${tr.umo || "—"}，${tr.ok ? '成功' : '失败' + (tr.error ? '：' + tr.error : '')}。`).join(" ");
             return `<tr>
                 <td><time class="log-time">${fmtTs(l.time)}</time></td>
@@ -581,10 +586,10 @@ async function init() {
         const name = $("task-name").value;
         $("editor-task-name").textContent = name;
         $("editor-task-name").hidden = !name;
-        $("task-name-count").textContent = `${name.length} / 32`;
+        $("task-name-count").textContent = `${name.length} / ${taskNameMaxLength}`;
     }
     $("task-name").addEventListener("input", () => {
-        $("task-name").value = $("task-name").value.slice(0, 32);
+        $("task-name").value = $("task-name").value.slice(0, taskNameMaxLength);
         updateEditorName();
     });
     function openModal() { modal.classList.add("active"); if (!modal.open) modal.showModal(); }
@@ -626,7 +631,7 @@ async function init() {
             $("task-name").value = task.name || "";
             $("task-enabled").checked = task.enabled !== false;
             const c = task.content || {};
-            $("task-mode").value = c.mode || (c.use_llm ? "conversation" : "fixed");
+            $("task-mode").value = c.mode;
             $("task-text").value = c.text || "";
             $("task-system-prompt").value = c.system_prompt || "";
             $("task-time-aware").checked = c.time_aware !== false;
@@ -649,8 +654,6 @@ async function init() {
         }
         nextTriggerId = triggers.reduce((max, t) => Math.max(max, t.id), 0) + 1;
         selectedTriggerId = triggers.length ? triggers[0].id : null;
-        $("migration-notice").hidden = !task || !task.migration_notice;
-        $("migration-notice").textContent = task ? task.migration_notice || "" : "";
         $("target-method-manual").checked = !!$("target-custom").value && !sessionsList.includes($("target-custom").value);
         $("target-method-session").checked = !$("target-method-manual").checked;
         updateEditorName();
@@ -994,14 +997,20 @@ async function init() {
             showToast("请使用单个 target 对话字符串，不再支持 targets 数组", true);
             return;
         }
-        if (String(obj.name || "").trim().length > 32) { showToast("任务名称不能超过 32 个字符", true); return; }
+        if (["logic_expr", "migration_notice", "invalid_data"].some(key => key in obj) ||
+            (obj.content && "use_llm" in Object(obj.content)) ||
+            (Array.isArray(obj.triggers) && obj.triggers.some(t => t && "last_fired" in Object(t)))) {
+            showToast("不再支持旧任务格式，请重新创建任务", true);
+            return;
+        }
+        if (String(obj.name || "").trim().length > taskNameMaxLength) { showToast(`任务名称不能超过 ${taskNameMaxLength} 个字符`, true); return; }
         applyTaskPayload(obj);
         setJsonMode(false);
     });
 
     function validateForm() {
         if (!$("task-name").value.trim()) { showToast("请填写任务名称", true); chooseEditorTab("basic"); $("task-name").focus(); return false; }
-        if ($("task-name").value.trim().length > 32) { showToast("任务名称不能超过 32 个字符", true); chooseEditorTab("basic"); return false; }
+        if ($("task-name").value.trim().length > taskNameMaxLength) { showToast(`任务名称不能超过 ${taskNameMaxLength} 个字符`, true); chooseEditorTab("basic"); return false; }
         if (!triggers.length) { showToast("至少需要一个触发器", true); return false; }
         if (!activeTriggers().length) { showToast("至少需要一个主动型触发器（周期型或 cron 型）", true); return false; }
         if (!$("target-custom").value.trim() && $("task-text").value.trim()) { showToast("请选择一个发送目标对话", true); return false; }
@@ -1023,7 +1032,7 @@ async function init() {
                 showToast("JSON 顶层必须是对象", true);
                 return;
             }
-            if (String(payload.name || "").trim().length > 32) { showToast("任务名称不能超过 32 个字符", true); return; }
+            if (String(payload.name || "").trim().length > taskNameMaxLength) { showToast(`任务名称不能超过 ${taskNameMaxLength} 个字符`, true); return; }
             // id 以当前编辑的任务为准（新增时不带 id）
             const editingId = $("task-id").value;
             if (editingId) payload.id = editingId;

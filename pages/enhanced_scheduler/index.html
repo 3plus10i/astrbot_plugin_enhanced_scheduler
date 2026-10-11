@@ -9,7 +9,7 @@
 <body>
   <div class="app-container">
     <header class="app-header">
-      <div class="header-title"><h1>增强计划任务</h1><span class="plugin-version">v1.5.0</span></div>
+      <div class="header-title"><h1>增强计划任务</h1><span class="plugin-version">v1.5.1</span></div>
       <nav class="tab-nav" aria-label="插件页面">
         <button type="button" class="tab-btn active" data-tab="tasks" aria-current="page">计划任务</button>
         <button type="button" class="tab-btn" data-tab="logs">运行日志</button>
@@ -19,7 +19,7 @@
     </header>
     <main class="app-content">
       <section id="view-tasks" class="tab-view active" aria-labelledby="tasks-title">
-        <div class="page-heading"><div class="heading-group"><h2 id="tasks-title">计划任务</h2><span class="muted" id="task-count"></span></div><div class="button-group"><button class="btn btn-secondary" id="refresh-tasks-btn" type="button">刷新</button><button class="btn btn-primary" id="add-task-btn" type="button">+ 新建任务</button></div></div>
+        <div class="page-heading"><div class="heading-group"><h2 id="tasks-title">计划任务</h2><span class="muted" id="task-count"></span></div><div class="button-group"><button class="btn btn-secondary" id="refresh-tasks-btn" type="button">刷新</button><button class="btn btn-primary" id="add-task-btn" type="button" disabled>+ 新建任务</button></div></div>
         <div class="table-surface"><table class="data-table tasks-table">
           <colgroup><col class="task-col"><col class="status-col"><col class="rules-col"><col class="next-col"><col class="mode-col"><col class="actions-col"></colgroup>
           <thead><tr><th scope="col">任务 / 发送对象</th><th scope="col">状态</th><th scope="col">触发规则</th><th scope="col">下次检查</th><th scope="col">执行模式</th><th scope="col">操作</th></tr></thead>
@@ -62,9 +62,8 @@
       <div class="editor-body" id="task-form-body">
         <section id="editor-basic" class="editor-panel" role="tabpanel" aria-labelledby="tab-basic">
           <div class="task-enabled-row"><label class="switch-toggle"><input id="task-enabled" type="checkbox" role="switch" checked><span class="slider"></span></label><label for="task-enabled">启用此任务</label></div>
-          <div class="field"><label for="task-name">任务名称</label><input id="task-name" class="form-input" placeholder="例如：喝水提醒" autocomplete="off" maxlength="32" required aria-describedby="task-name-count"><div class="name-hint field-hint"><span id="task-name-count">0 / 32</span></div></div>
+          <div class="field"><label for="task-name">任务名称</label><input id="task-name" class="form-input" placeholder="例如：喝水提醒" autocomplete="off" required aria-describedby="task-name-count"><div class="name-hint field-hint"><span id="task-name-count"></span></div></div>
           <div class="field target-field"><label for="target-select">发送对象</label><div class="target-method"><label><input id="target-method-session" type="radio" name="target-method" checked>选择会话</label><label><input id="target-method-manual" type="radio" name="target-method">手动输入 UMO</label></div><select id="target-select" class="form-input"><option value="">不指定发送对象</option></select><input id="target-custom" class="form-input" placeholder="平台:消息类型:标识" aria-label="手动输入发送对象 UMO" hidden></div>
-          <p class="inline-notice" id="migration-notice" hidden></p>
         </section>
         <section id="editor-rules" class="editor-panel" role="tabpanel" aria-labelledby="tab-rules" hidden>
           <div class="rule-layout"><div class="rule-list-pane" id="trigger-canvas"><p class="field-hint rule-explanation">任一主动触发，且所有被动条件满足时执行。</p>

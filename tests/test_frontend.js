@@ -16,6 +16,7 @@ function $(id) {
 }
 const messages = [];
 const context = vm.createContext({
+    taskNameMaxLength: 32,
     $, sessionsList: ["test:FriendMessage:one", "test:FriendMessage:two"],
     escapeHtml: value => value, showToast: value => messages.push(value),
     triggers: [{id: 1, type: "interval", config: {minutes: 1}}],
@@ -74,6 +75,12 @@ $("task-json").value = JSON.stringify({name: "x".repeat(33), target: "other", tr
 $("task-json-toggle").listeners.click();
 assert.equal($("target-custom").value, "");
 assert.match(messages.at(-1), /32/);
+
+// Returning to the form cannot silently convert removed legacy fields.
+$("task-json").value = JSON.stringify({name: "old", content: {use_llm: true}, target: "other"});
+$("task-json-toggle").listeners.click();
+assert.match(messages.at(-1), /不再支持旧任务格式/);
+assert.equal($("target-custom").value, "");
 
 // Editing old oversized units must preserve the total duration exactly.
 const durationSource = source.slice(source.indexOf("    function normalizeDurationConfig("), source.indexOf("    function renderTriggerCanvas("));

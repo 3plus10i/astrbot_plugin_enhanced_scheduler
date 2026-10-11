@@ -17,9 +17,6 @@ RUN_LOG_FILE_NAME = "run_logs.json"
 LLM_LOG_DIR_NAME = "llm_logs"
 LLM_REC_DIR_NAME = "rec"
 LLM_IMG_DIR_NAME = "img"
-LEGACY_LLM_LOG_FILE_NAME = "llm_calls.jsonl"
-# 旧版默认「独立 AI 系统提示」；该包裹文本已迁到任务提示词外层，迁移时与之一致的旧值清空
-LEGACY_STANDALONE_SYSTEM_PROMPT = "<proactive_trigger>这是由计划任务自动触发的一次会话，现在时间是 {{time}}。请根据用户的指令进行回复。你的回复将被直接发送给用户。</proactive_trigger>"
 
 class TaskStore:
     def __init__(self, data_dir, config, core):
@@ -32,7 +29,6 @@ class TaskStore:
         self.llm_log_dir = os.path.join(data_dir, LLM_LOG_DIR_NAME)
         self.llm_rec_dir = os.path.join(self.llm_log_dir, LLM_REC_DIR_NAME)
         self.llm_img_dir = os.path.join(self.llm_log_dir, LLM_IMG_DIR_NAME)
-        self.legacy_llm_log_file = os.path.join(data_dir, LEGACY_LLM_LOG_FILE_NAME)
         os.makedirs(self.llm_rec_dir, exist_ok=True)
         os.makedirs(self.llm_img_dir, exist_ok=True)
         self._lock = asyncio.Lock()
@@ -40,9 +36,7 @@ class TaskStore:
         self.run_logs = []
         self._load_data_sync()
         self._load_run_logs_sync()
-        self._migrate_targets()
         self._llm_seq = self._scan_llm_seq_io()
-        self._migrate_legacy_llm_logs()
 
     @property
     def tasks(self):
@@ -114,68 +108,16 @@ class TaskStore:
         if not isinstance(self.data.get("tasks", {}), dict):
             raise ValueError("任务文件中的 tasks 必须是对象")
         self.data.setdefault("tasks", {})
-        for task_id, task in list(self.tasks.items()):
-            if not isinstance(task, dict):
-                self.tasks[task_id] = {
-                    "id": task_id, "name": task_id, "enabled": False,
-                    "target": "", "triggers": [], "content": {},
-                    "migration_notice": "旧任务格式错误，请重新配置", "invalid_data": task,
-                }
-        # 数据迁移：
-        #   use_llm(bool) -> mode(fixed/standalone/conversation)
-        #   取消逻辑组合 -> 删除 logic_expr（改由"主动或/被动且"固定语义）
-        #   新增内容开关 time_aware；旧版默认独立 AI 系统提示（包裹文本）清空
-        for task in self.data.get("tasks", {}).values():
-            if not isinstance(task, dict):
-                continue
-            task.pop("logic_expr", None)
-            content = task.get("content")
-            if isinstance(content, dict):
-                content["mode"] = _resolve_mode(content)
-                content.pop("use_llm", None)
-                if not isinstance(content.get("time_aware"), bool):
-                    content["time_aware"] = True
-                if not isinstance(content.get("holiday_aware"), bool):
-                    content["holiday_aware"] = False
-                if content.get("system_prompt") == LEGACY_STANDALONE_SYSTEM_PROMPT:
-                    content["system_prompt"] = ""
-        # 数据迁移：主动触发器不再保存 last_fired，旧字段仅兼容读取并清除。
-        for task in self.data.get("tasks", {}).values():
-            if not isinstance(task, dict):
-                continue
-            for trigger in task.get("triggers", []) if isinstance(task.get("triggers"), list) else []:
-                if isinstance(trigger, dict) and trigger.get("type") in self.core.ACTIVE_TYPES:
-                    trigger.pop("last_fired", None)
-        # 数据迁移：旧版 interval 触发器无 base_time -> 补为创建日 0 点
-        for task in self.data.get("tasks", {}).values():
-            if not isinstance(task, dict):
-                continue
-            try:
-                created = float(task.get("created_at", 0.0) or 0.0)
-            except (ValueError, TypeError):
-                created = 0.0
-            ref_ts = created if created > 0 else time.time()
-            for tg in task.get("triggers", []) if isinstance(task.get("triggers"), list) else []:
-                if not isinstance(tg, dict):
-                    continue
-                if tg.get("type") == "interval":
-                    cfg = tg.get("config")
-                    if isinstance(cfg, dict) and not str(cfg.get("base_time", "")).strip():
-                        cfg["base_time"] = self.core.day_start_iso(ref_ts)
-
-    def _migrate_targets(self):
-        for task in self.tasks.values():
-            if "targets" not in task:
-                continue
-            old = task.pop("targets")
-            first = old[0] if isinstance(old, list) and old else ""
-            task["target"] = first.strip() if isinstance(first, str) else ""
-            if not isinstance(old, list) or len(old) > 1:
-                task["enabled"] = False
-                task["migration_notice"] = "旧多目标任务已停用，仅保留第一个发送目标，请编辑保存后重新启用"
+        # Only current definitions are loaded. Old files are not converted or deleted.
+        current = {task_id: task for task_id, task in self.tasks.items()
+                   if self.core.is_current_task_format(task)}
+        skipped = len(self.tasks) - len(current)
+        self.data = {"tasks": current}
+        if skipped:
+            logger.warning(f"[EnhancedScheduler] 已跳过 {skipped} 个旧格式或格式错误任务；1.5.1 起不再自动迁移，请重新创建")
 
     def _load_run_logs_sync(self):
-        """加载运行日志；同时把旧版存在 tasks.json 里的 logs 迁移到独立文件。"""
+        """只加载当前独立运行日志文件。"""
         if os.path.exists(self.run_log_file):
             try:
                 with open(self.run_log_file, "r", encoding="utf-8") as f:
@@ -184,16 +126,6 @@ class TaskStore:
                     self.run_logs = [e for e in loaded if isinstance(e, dict)]
             except Exception as e:
                 logger.error(f"[EnhancedScheduler] 读取运行日志失败，使用空日志: {e}")
-        legacy = self.data.pop("logs", None)
-        if legacy is None:
-            return
-        if isinstance(legacy, list):
-            for entry in legacy:
-                if isinstance(entry, dict):
-                    self.append_log(entry)
-        self._write_json(self.data_file, self.data)
-        self._write_json(self.run_log_file, self.run_logs)
-        logger.info(f"[EnhancedScheduler] 运行日志已从 tasks.json 迁移到 {RUN_LOG_FILE_NAME}")
 
     def append_log(self, entry: dict):
         """追加一条运行日志（仅内存）；持久化由调用方在一个批次结束时统一执行。"""
@@ -235,29 +167,6 @@ class TaskStore:
             if m:
                 max_seq = max(max_seq, int(m.group(1)))
         return max_seq + 1
-
-    def _migrate_legacy_llm_logs(self):
-        """把旧版单文件 llm_calls.jsonl 一次性拆分为逐条记录文件，完成后改名备份。"""
-        if not os.path.exists(self.legacy_llm_log_file):
-            return
-        migrated = 0
-        try:
-            with open(self.legacy_llm_log_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except Exception:
-                        continue
-                    if isinstance(entry, dict):
-                        self._write_llm_record_io(entry)
-                        migrated += 1
-            os.replace(self.legacy_llm_log_file, self.legacy_llm_log_file + ".migrated")
-            logger.info(f"[EnhancedScheduler] 已迁移 {migrated} 条旧版 LLM 日志到逐条记录文件")
-        except Exception as e:
-            logger.error(f"[EnhancedScheduler] 迁移旧版 LLM 日志失败: {e}")
 
     def _list_llm_records_io(self) -> List[str]:
         """列出记录文件名，最新在前。"""
@@ -394,25 +303,6 @@ class TaskStore:
     def _append_llm_log_io(self, entry):
         self._write_llm_record_io(entry)
         self._trim_llm_records_io()
-
-
-# 执行模式枚举
-MODE_FIXED = "fixed"                # 发送文本到对话（不经过 LLM）
-MODE_STANDALONE = "standalone"      # 调用独立 AI 回复（本插件 system prompt，不注入人格）
-MODE_CONVERSATION = "conversation"  # 调用对话配置的 AI 回复（注入人格/记忆）
-VALID_MODES = (MODE_FIXED, MODE_STANDALONE, MODE_CONVERSATION)
-
-
-def _resolve_mode(content) -> str:
-    """解析任务内容的执行模式。兼容旧版 use_llm(bool) 字段。"""
-    if not isinstance(content, dict):
-        return MODE_FIXED
-    mode = content.get("mode")
-    if mode in VALID_MODES:
-        return mode
-    if content.get("use_llm"):
-        return MODE_CONVERSATION
-    return MODE_FIXED
 
 
 _B64_IMG_RE = re.compile(r"data:image/[\w.+-]+;base64,[A-Za-z0-9+/=_-]+")

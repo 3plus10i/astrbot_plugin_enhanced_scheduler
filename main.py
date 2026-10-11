@@ -3,6 +3,7 @@ import copy
 import importlib.util
 import math
 import os
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -26,9 +27,28 @@ TaskStore = _load_local("storage").TaskStore
 TaskExecutor = _load_local("task_executor").TaskExecutor
 SchedulerRuntime = _load_local("scheduler_runtime").SchedulerRuntime
 PLUGIN_NAME = "astrbot_plugin_enhanced_scheduler"
+TASK_NAME_MAX_LENGTH = 32
+COPY_NAME_SUFFIX = " (副本)"
+COPY_NAME_PATTERN = re.compile(re.escape(COPY_NAME_SUFFIX[:-1]) + r"(?: ([1-9][0-9]*))?" + re.escape(COPY_NAME_SUFFIX[-1]) + r"$")
 
 
-@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，主动取或、被动取且的多触发器组合。", "1.5.0")
+def _copy_task_name(source_name: str, existing_names: set[str]) -> str:
+    """沿用副本编号，检查截断后的完整名称，直到找到未占用的名称。"""
+    base_name = source_name
+    number = 1
+    # 同时收敛此前连续复制形成的重复副本后缀。
+    while match := COPY_NAME_PATTERN.search(base_name):
+        number = max(number, int(match.group(1) or 1) + 1)
+        base_name = base_name[:match.start()]
+    while True:
+        suffix = COPY_NAME_SUFFIX if number == 1 else COPY_NAME_SUFFIX[:-1] + f" {number}" + COPY_NAME_SUFFIX[-1]
+        candidate = base_name[:max(0, TASK_NAME_MAX_LENGTH - len(suffix))].rstrip() + suffix
+        if candidate not in existing_names:
+            return candidate
+        number += 1
+
+
+@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，主动取或、被动取且的多触发器组合。", "1.5.1")
 class EnhancedSchedulerPlugin(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):
         super().__init__(context)
@@ -71,7 +91,8 @@ class EnhancedSchedulerPlugin(Star):
 
     async def _api_get_data(self):
         from quart import jsonify
-        resp = {"status": "success", "config": self.config}
+        resp = {"status": "success", "config": self.config,
+                "limits": {"task_name_max_length": TASK_NAME_MAX_LENGTH}}
         # 预计算每个任务的下次主动触发时间，供前端直接展示（无需逐行异步请求）
         now = time.time()
         tasks_out = {}
@@ -177,8 +198,10 @@ class EnhancedSchedulerPlugin(Star):
         name = str(req.get("name", "")).strip()
         if not name:
             return False, "任务名称不能为空", ""
-        if len(name) > 32:
-            return False, "任务名称不能超过 32 个字符", ""
+        if len(name) > TASK_NAME_MAX_LENGTH:
+            return False, f"任务名称不能超过 {TASK_NAME_MAX_LENGTH} 个字符", ""
+        if any(key in req for key in ("logic_expr", "migration_notice", "invalid_data")):
+            return False, "不再支持旧任务格式，请重新创建任务", ""
 
         triggers = req.get("triggers", [])
         if not isinstance(triggers, list) or not triggers:
@@ -192,6 +215,8 @@ class EnhancedSchedulerPlugin(Star):
         for tg in triggers:
             if not isinstance(tg, dict):
                 return False, "触发器格式错误", ""
+            if "last_fired" in tg:
+                return False, "不再支持触发器 last_fired 字段", ""
             tid = tg.get("id")
             if not isinstance(tid, int) or tid < 1:
                 return False, f"触发器 id 必须是正整数（收到 {tid}）", ""
@@ -221,6 +246,8 @@ class EnhancedSchedulerPlugin(Star):
         content = req.get("content", {})
         if not isinstance(content, dict):
             return False, "任务内容格式错误", ""
+        if "use_llm" in content:
+            return False, "不再支持 use_llm 字段，请使用 mode 指定执行模式", ""
         text = str(content.get("text", "") or "")
         mode = content.get("mode", "fixed")
         if mode not in ("fixed", "standalone", "conversation"):
@@ -259,8 +286,6 @@ class EnhancedSchedulerPlugin(Star):
                 "holiday_aware": holiday_aware,
             }
             task["target"] = target
-            task.pop("migration_notice", None)
-            task.pop("invalid_data", None)
             task["updated_at"] = now
             return True, "", task_id
         else:
@@ -320,11 +345,9 @@ class EnhancedSchedulerPlugin(Star):
                 task = copy.deepcopy(self.store.tasks[src_id])
             now = time.time()
             new_id = str(uuid.uuid4())
-            task.update(id=new_id, name=str(task.get("name", ""))[:27] + " (副本)", enabled=False,
+            name = _copy_task_name(str(task.get("name", "")), {str(t.get("name", "")) for t in self.store.tasks.values()})
+            task.update(id=new_id, name=name, enabled=False,
                         created_at=now, updated_at=now, last_success_time=0.0)
-            for trigger in task.get("triggers", []):
-                if isinstance(trigger, dict) and trigger.get("type") in core.ACTIVE_TYPES:
-                    trigger.pop("last_fired", None)
             self.store.tasks[new_id] = task
             try:
                 await self.store.save(include_logs=False)

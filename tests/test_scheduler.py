@@ -395,12 +395,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         saved = json.loads(Path(self.store.data_file).read_text(encoding="utf-8"))
         self.assertNotIn("last_fired", saved["tasks"]["a"]["triggers"][0])
 
-    async def test_migrated_task_cannot_be_manually_sent_before_edit(self):
+    async def test_legacy_task_cannot_be_manually_sent(self):
         definition = task()
         definition.update(enabled=False, migration_notice="请重新配置")
         self.store.tasks["a"] = definition
         await self.runtime.start()
-        with self.assertRaisesRegex(ValueError, "先编辑"):
+        with self.assertRaisesRegex(ValueError, "不再支持旧任务格式"):
             await self.runtime.trigger_now("a")
         self.assertEqual(self.executor.calls, [])
 
@@ -447,23 +447,44 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         assert Path(self.directory.name).resolve().is_relative_to((ROOT / "tests").resolve())
         self.addCleanup(self.directory.cleanup)
 
-    async def test_multi_target_migration_is_disabled_and_idempotent(self):
-        multi = task()
-        multi.pop("target")
-        multi["targets"] = ["first", "second"]
-        single = task("b")
-        single.pop("target")
-        single["targets"] = ["only"]
+    async def test_legacy_tasks_are_skipped_without_conversion(self):
+        variants = {}
+        for field, value in (("targets", ["first", "second"]), ("logic_expr", "1 and 2"),
+                             ("migration_notice", "请重新配置")):
+            old = task(field)
+            old[field] = value
+            variants[field] = old
+        old_mode = task("mode")
+        old_mode["content"] = {"text": "hello", "use_llm": True}
+        variants["mode"] = old_mode
+        old_interval = task("interval")
+        old_interval["triggers"][0]["config"].pop("base_time")
+        variants["interval"] = old_interval
+        cursor = task("cursor")
+        cursor["triggers"][0]["last_fired"] = 1
+        variants["cursor"] = cursor
+        variants["malformed"] = "broken"
+        variants["current"] = task("current")
         path = Path(self.directory.name) / "tasks.json"
-        path.write_text(json.dumps({"tasks": {"a": multi, "b": single}}), encoding="utf-8")
+        original = json.dumps({"tasks": variants, "logs": [{"detail": "legacy"}]})
+        path.write_text(original, encoding="utf-8")
         store = storage_module.TaskStore(self.directory.name, {}, core)
-        self.assertEqual(store.tasks["a"]["target"], "first")
-        self.assertFalse(store.tasks["a"]["enabled"])
-        self.assertNotIn("targets", store.tasks["a"])
-        self.assertTrue(store.tasks["b"]["enabled"])
+        self.assertEqual(store.tasks, {"current": variants["current"]})
+        self.assertEqual(store.run_logs, [])
+        self.assertEqual(path.read_text(encoding="utf-8"), original)
         await store.save()
         reloaded = storage_module.TaskStore(self.directory.name, {}, core)
         self.assertEqual(reloaded.tasks, store.tasks)
+        self.assertNotIn("logs", reloaded.data)
+
+    async def test_legacy_llm_file_is_not_imported_or_renamed(self):
+        path = Path(self.directory.name) / "llm_calls.jsonl"
+        original = json.dumps({"ts": time.time(), "task_name": "old", "ok": True})
+        path.write_text(original + "\n", encoding="utf-8")
+        store = storage_module.TaskStore(self.directory.name, {}, core)
+        self.assertEqual(store._list_llm_records_io(), [])
+        self.assertEqual(path.read_text(encoding="utf-8"), original + "\n")
+        self.assertFalse(path.with_suffix(".jsonl.migrated").exists())
 
     async def test_corrupt_file_is_not_overwritten(self):
         path = Path(self.directory.name) / "tasks.json"
@@ -702,15 +723,107 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(name), 32)
         self.assertTrue(name.endswith(" (副本)"))
 
-    async def test_saving_migrated_task_clears_notice(self):
-        old = task()
-        old.update(enabled=False, migration_notice="需要重新配置")
-        self.plugin.store.tasks["a"] = old
+    async def test_copying_copies_numbers_names_within_shared_limit(self):
+        for case, limit, original_name in (("short", main_module.TASK_NAME_MAX_LENGTH, "每日提醒"),
+                                           ("long", main_module.TASK_NAME_MAX_LENGTH, "中" * main_module.TASK_NAME_MAX_LENGTH),
+                                           ("custom", 12, "改" * 12)):
+            with self.subTest(case=case), patch.object(main_module, "TASK_NAME_MAX_LENGTH", limit):
+                source_id = "source-" + case
+                self.request.body = dict(task(source_id), name=original_name, last_success_time=123)
+                self.assertEqual((await self.plugin._api_upsert_task())["status"], "success")
+                original = copy.deepcopy(self.plugin.store.tasks[source_id])
+                names = {original_name}
+                ids = {source_id}
+                for number in range(1, 13):
+                    self.request.body = {"id": source_id}
+                    response = await self.plugin._api_copy_task()
+                    self.assertEqual(response["status"], "success")
+                    copied = self.plugin.store.tasks[response["id"]]
+                    suffix = main_module.COPY_NAME_SUFFIX if number == 1 else f" (副本 {number})"
+                    self.assertEqual(copied["name"], original_name[:limit - len(suffix)] + suffix)
+                    self.assertLessEqual(len(copied["name"]), limit)
+                    self.assertNotIn(copied["name"], names)
+                    self.assertNotIn(copied["id"], ids)
+                    self.assertFalse(copied["enabled"])
+                    self.assertEqual(copied["last_success_time"], 0)
+                    for key in ("target", "triggers", "content"):
+                        self.assertEqual(copied[key], original[key])
+                    names.add(copied["name"])
+                    ids.add(copied["id"])
+                    source_id = copied["id"]
+                self.assertEqual(self.plugin.store.tasks[original["id"]], original)
+                copied["content"]["text"] = "修改最后一个副本"
+                self.assertEqual(self.plugin.store.tasks[original["id"]]["content"], original["content"])
+
+    async def test_copy_skips_existing_names_after_truncation(self):
+        limit = main_module.TASK_NAME_MAX_LENGTH
+        original_name = "长" * limit
+        occupied = []
+        for number in range(1, 11):
+            suffix = main_module.COPY_NAME_SUFFIX if number == 1 else f" (副本 {number})"
+            occupied.append(original_name[:limit - len(suffix)] + suffix)
+        for index, name in enumerate([original_name, *occupied]):
+            self.request.body = dict(task(str(index)), name=name)
+            self.assertEqual((await self.plugin._api_upsert_task())["status"], "success")
+        previous = copy.deepcopy(self.plugin.store.tasks)
+        # 既覆盖再次复制原任务，也覆盖复制已有副本后跳过所有重名编号。
+        for source_id, number in (("0", 11), ("1", 12)):
+            self.request.body = {"id": source_id}
+            response = await self.plugin._api_copy_task()
+            self.assertEqual(response["status"], "success")
+            name = self.plugin.store.tasks[response["id"]]["name"]
+            suffix = f" (副本 {number})"
+            self.assertEqual(name, original_name[:limit - len(suffix)] + suffix)
+            self.assertLessEqual(len(name), limit)
+        for task_id, source in previous.items():
+            self.assertEqual(self.plugin.store.tasks[task_id], source)
+
+    async def test_copy_of_numbered_copy_continues_its_number(self):
+        self.request.body = dict(task(), name="提醒 (副本 4)")
+        self.assertEqual((await self.plugin._api_upsert_task())["status"], "success")
+        self.request.body = {"id": "a"}
+        response = await self.plugin._api_copy_task()
+        self.assertEqual(response["status"], "success")
+        self.assertEqual(self.plugin.store.tasks[response["id"]]["name"], "提醒 (副本 5)")
+
+    async def test_copy_collapses_repeated_suffixes(self):
+        self.request.body = dict(task(), name="提醒 (副本) (副本)")
+        self.assertEqual((await self.plugin._api_upsert_task())["status"], "success")
+        self.request.body = {"id": "a"}
+        response = await self.plugin._api_copy_task()
+        self.assertEqual(response["status"], "success")
+        self.assertEqual(self.plugin.store.tasks[response["id"]]["name"], "提醒 (副本 2)")
+
+    async def test_old_fields_cannot_be_saved_as_current_tasks(self):
+        for field, value in (("logic_expr", "1"), ("migration_notice", "重新配置")):
+            with self.subTest(field=field):
+                self.request.body = dict(task(), **{field: value})
+                response, status = await self.plugin._api_upsert_task()
+                self.assertEqual(status, 400)
+                self.assertEqual(self.plugin.store.tasks, {})
+        self.request.body = dict(task(), content={"use_llm": True, "text": "hello"})
+        response, status = await self.plugin._api_upsert_task()
+        self.assertEqual(status, 400)
+        self.assertIn("use_llm", response["message"])
         self.request.body = task()
-        result = await self.plugin._api_upsert_task()
-        self.assertEqual(result["status"], "success")
-        self.assertNotIn("migration_notice", self.plugin.store.tasks["a"])
-        self.assertTrue(self.plugin.store.tasks["a"]["enabled"])
+        self.request.body["triggers"][0]["last_fired"] = 123
+        response, status = await self.plugin._api_upsert_task()
+        self.assertEqual(status, 400)
+        self.assertIn("last_fired", response["message"])
+
+    async def test_name_limit_is_shared_by_ui_save_and_copy(self):
+        with patch.object(main_module, "TASK_NAME_MAX_LENGTH", 12):
+            response = await self.plugin._api_get_data()
+            self.assertEqual(response["limits"]["task_name_max_length"], 12)
+            self.request.body = dict(task(), name="中" * 13)
+            self.assertEqual((await self.plugin._api_upsert_task())[1], 400)
+            self.request.body = dict(task(), name="中" * 12)
+            self.assertEqual((await self.plugin._api_upsert_task())["status"], "success")
+            self.request.body = {"id": "a"}
+            copied = await self.plugin._api_copy_task()
+            name = self.plugin.store.tasks[copied["id"]]["name"]
+            self.assertEqual(len(name), 12)
+            self.assertTrue(name.endswith(main_module.COPY_NAME_SUFFIX))
 
 
 if __name__ == "__main__":
