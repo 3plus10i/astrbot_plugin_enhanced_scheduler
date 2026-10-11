@@ -47,6 +47,7 @@ T_COOLDOWN = "cooldown"
 ACTIVE_TYPES = (T_INTERVAL, T_CRON)      # 主动型：自己到点触发（多个之间取"或"）
 PASSIVE_TYPES = (T_WINDOW, T_RANDOM, T_COOLDOWN)  # 被动型：被主动型唤起后求值（多个之间取"且"）
 ALL_TYPES = ACTIVE_TYPES + PASSIVE_TYPES
+MAX_TRIGGER_ID = (1 << 53) - 1  # 前端 Number 可精确表示的整数上限。
 
 # 下次触发时刻推进上限：每次推进都跨过一个未开启区间，正常几步内收敛
 _PREVIEW_MAX_STEPS = 64
@@ -115,8 +116,8 @@ def validate_trigger(trigger: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "触发器必须是对象"
 
     tid = trigger.get("id")
-    if not isinstance(tid, int) or tid < 1:
-        return False, "触发器 id 必须是正整数"
+    if isinstance(tid, bool) or not isinstance(tid, int) or not 1 <= tid <= MAX_TRIGGER_ID:
+        return False, "触发器 id 必须是可精确表示的正整数"
 
     ttype = trigger.get("type")
     if ttype not in ALL_TYPES:
@@ -337,6 +338,34 @@ def next_trigger_preview(triggers: List[Dict[str, Any]],
             return None
         cursor = nxt
     return None
+
+
+def next_task_preview(triggers: List[Dict[str, Any]], now_ts: float,
+                      task_last_success: float = 0.0) -> Dict[str, Any]:
+    """可执行机会的最早时间及其概率；随机条件独立采样，联合概率取乘积。"""
+    if (not isinstance(triggers, list) or not triggers or
+            any(not validate_trigger(tg)[0] for tg in triggers) or
+            len({tg["id"] for tg in triggers}) != len(triggers) or
+            not any(tg["type"] in ACTIVE_TYPES for tg in triggers)):
+        return {"next_fire": None, "execution_probability": None}
+    probability = math.prod(float(tg["config"]["threshold"])
+                            for tg in triggers if tg["type"] == T_RANDOM)
+    return {
+        "next_fire": next_trigger_preview(triggers, now_ts, task_last_success) if probability > 0 else None,
+        "execution_probability": probability,
+    }
+
+
+def trigger_labels(triggers: List[Dict[str, Any]]) -> Dict[int, str]:
+    """稳定 ID 与显示编号分离：每组按 ID 升序从 1 连续编号。"""
+    if not isinstance(triggers, list):
+        return {}
+    valid = [tg for tg in triggers if isinstance(tg, dict) and isinstance(tg.get("id"), int)]
+    labels = {}
+    for prefix, types in (("A", ACTIVE_TYPES), ("B", PASSIVE_TYPES)):
+        group = sorted((tg for tg in valid if tg.get("type") in types), key=lambda tg: tg["id"])
+        labels.update({tg["id"]: f"{prefix}{index}" for index, tg in enumerate(group, 1)})
+    return labels
 
 
 # ─────────────────────────────────────────────────────────────────────

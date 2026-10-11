@@ -10,6 +10,7 @@ async function init() {
     let savedConfig = null;
     let taskNameMaxLength = null; // Defined once by the backend and shared through get_data.
     const LOGS_PAGE_SIZE = 20;
+    const AUTO_REFRESH_INTERVAL_MS = 15000;
     let logsPage = 0;
 
     // ── 工具函数 ──
@@ -114,7 +115,7 @@ async function init() {
                     <td><button type="button" class="task-name edit-task-btn" data-id="${escapeHtml(k)}">${escapeHtml(t.name)}</button><div class="cell-secondary task-target" title="${escapeHtml(t.target || '')}">${escapeHtml(t.target || "未指定发送对象")}</div></td>
                     <td class="cell-wrap"><span class="badge ${stateClass}">${escapeHtml(stateText)}</span>${runtime.error ? `<div class="form-hint row-error">${escapeHtml(runtime.error)}</div>` : ''}</td>
                     <td class="cell-wrap">${trigSummary || '—'}</td>
-                    <td class="next-check">${nf ? `<time class="tabular">${fmtTs(nf).slice(0, 16)}</time><div class="cell-secondary next-relative" data-next-fire="${Number(nf)}">${remainingTime(nf)}</div>` : '—'}</td>
+                    <td class="next-check">${nf ? `<time class="tabular">${fmtTs(nf)}</time><div class="cell-secondary">${probabilityText(t._execution_probability)}</div><div class="cell-secondary next-relative" data-next-fire="${Number(nf)}">${remainingTime(nf)}</div>` : (t.enabled && t._execution_probability === 0 ? '不会执行（概率 0%）' : '—')}</td>
                     <td>${hasText ? escapeHtml(modeCN) : '空动作'}</td>
                     <td><div class="actions-cell">
                         <button type="button" class="text-btn edit-task-btn" data-id="${escapeHtml(k)}">编辑</button>
@@ -126,9 +127,29 @@ async function init() {
     }
     function remainingTime(ts) {
         const total = Math.max(0, Math.ceil((Number(ts) * 1000 - Date.now()) / 60000));
-        if (!total) return "即将检查";
+        if (!total) return "即将到达任务时间";
         const d = Math.floor(total / 1440), h = Math.floor(total % 1440 / 60), m = total % 60;
         return `还剩 ${d ? d + "天" : ""}${h ? h + "时" : ""}${m}分`;
+    }
+    function probabilityText(probability) {
+        if (typeof probability !== "number" || !Number.isFinite(probability)) return "";
+        return `以${Number((probability * 100).toPrecision(4))}%概率执行`;
+    }
+    function triggerLabels(items) {
+        const labels = {};
+        [["A", ACTIVE_TYPES], ["B", PASSIVE_TYPES]].forEach(([prefix, types]) => {
+            items.filter(t => types.includes(t.type)).sort((a, b) => a.id - b.id)
+                .forEach((t, i) => { labels[t.id] = prefix + (i + 1); });
+        });
+        return labels;
+    }
+    function formatTriggerResults(log) {
+        // 新日志保存编号快照；此前记录仅在 ID 仍存在时借助任务定义显示编号。
+        const task = allTasks[log.task_id];
+        const labels = log.trigger_labels || triggerLabels(task && Array.isArray(task.triggers) ? task.triggers : []);
+        return Object.entries(log.trigger_tof || {}).map(([id, tof]) => [labels[id] || `#${id}`, tof])
+            .sort((a, b) => a[0].localeCompare(b[0], undefined, {numeric: true}))
+            .map(([label, tof]) => `${label} ${tof ? '✓' : '✗'}`).join("，");
     }
 
     async function loadRunLogs(page) {
@@ -153,8 +174,7 @@ async function init() {
             return;
         }
         body.innerHTML = entries.map(l => {
-            const tof = l.trigger_tof || {};
-            const tofStr = Object.keys(tof).map(id => `#${id} ${tof[id] ? '✓' : '✗'}`).join("，");
+            const tofStr = formatTriggerResults(l);
             const triggerInfo = l.source === "manual" ? "手动触发，跳过触发器检查。" : `${tofStr ? tofStr + "；" : ""}${l.logic_result ? "条件全部通过。" : "条件未全部满足。"}`;
             const actionCN = {send_llm:"AI 发送",send_fixed:"发送文本",noop:"空动作",partial:"部分失败",skipped:"跳过",failed:"失败"}[l.action] || l.action;
             const actionBadge = ["skipped", "noop"].includes(l.action) ? "badge-skipped" : (l.action === "failed" || l.action === "partial" ? "badge-failed" : "badge-active");
@@ -214,6 +234,7 @@ async function init() {
     let llmPage = 0;
     let llmTotal = 0;
     let llmLoadToken = 0;  // 切页/刷新时自增，作废在途请求
+    let llmListSignature = "";
     const LLM_PAGE_SIZE = 10;
     const llmDetailCache = new Map();  // 记录文件名 -> 正文
     const llmImageCache = new Map();   // 图片文件名 -> data URL
@@ -234,21 +255,23 @@ async function init() {
         $("llm-log-list").innerHTML = `<div class="llm-loading"><span class="spinner"></span>正在加载…</div>`;
         $("llm-pager").innerHTML = "";
     }
-    async function loadLlmLogs(page) {
+    async function loadLlmLogs(page, background = false) {
         if (typeof page === "number") llmPage = page;
-        const token = ++llmLoadToken;
-        showLlmLoading();
+        let token = background ? llmLoadToken : ++llmLoadToken;
+        if (!background) showLlmLoading();
         let res;
         try {
             res = await bridge.apiGet("get_llm_logs", { limit: LLM_PAGE_SIZE, offset: llmPage * LLM_PAGE_SIZE });
         } catch (e) {
             if (token !== llmLoadToken) return;
+            if (background) return;
             $("llm-log-list").innerHTML = `<div class="empty-hint">加载失败：${escapeHtml(e.message)}</div>`;
             showToast("加载 LLM 日志失败: " + e.message, true);
             return;
         }
         if (token !== llmLoadToken) return;
         if (!res || res.status !== "success") {
+            if (background) return;
             $("llm-log-list").innerHTML = `<div class="empty-hint">获取 LLM 日志失败。</div>`;
             showToast("获取 LLM 日志失败", true);
             return;
@@ -257,14 +280,26 @@ async function init() {
         llmLoaded = true;
         // 记录被裁剪后当前页可能越界，回到最后一页
         const maxPage = Math.max(0, Math.ceil(llmTotal / LLM_PAGE_SIZE) - 1);
-        if (llmPage > maxPage) return loadLlmLogs(maxPage);
+        if (llmPage > maxPage) return loadLlmLogs(maxPage, background);
         const entries = res.entries || [];
+        const signature = JSON.stringify([llmPage, llmTotal, entries]);
+        if (background && signature === llmListSignature) return;
+        const states = new Map();
+        if (background) {
+            token = ++llmLoadToken;
+            $("llm-log-list").querySelectorAll(".llm-log-card").forEach(card => states.set(card._name, {open: card.open, formatted: card._formatted}));
+        }
+        llmListSignature = signature;
         if (!entries.length) {
             $("llm-log-list").innerHTML = `<div class="empty-hint">暂无记录。</div>`;
             renderLlmPager();
             return;
         }
         const cards = renderLlmPlaceholders(entries);
+        cards.forEach(card => {
+            const state = states.get(card._name);
+            if (state) { card.open = state.open; card._formatted = state.formatted; }
+        });
         renderLlmPager();
         // 串行逐条取正文：到达一条即就绪一条，可展开一条
         for (const card of cards) {
@@ -556,7 +591,7 @@ async function init() {
 
     let triggers = [];            // [{id, type, config}]
     let selectedTriggerId = null;
-    let nextTriggerId = 1;
+    let lastTriggerTimestamp = 0;
     let lastValidate = { triggers: [], has_active: false, next_fire: null };
     let lastSuccessTime = 0;
 
@@ -605,7 +640,6 @@ async function init() {
         $("trigger-panel").innerHTML = "";
         setJsonMode(false);
     }
-    $("modal-close-btn").addEventListener("click", closeModal);
     $("modal-cancel-btn").addEventListener("click", closeModal);
     modal.addEventListener("cancel", e => { e.preventDefault(); closeModal(); });
     // 表单内容太多，点击遮罩层关闭容易误操作，暂时禁用
@@ -649,10 +683,9 @@ async function init() {
             $("task-mode").value = "fixed";
             $("task-time-aware").checked = true;
             $("task-holiday-aware").checked = false;
-            triggers = [{ id: 1, type: "interval", config: defaultConfigFor("interval") }];
+            triggers = [{ id: newTriggerId(), type: "interval", config: defaultConfigFor("interval") }];
             $("target-custom").value = "";
         }
-        nextTriggerId = triggers.reduce((max, t) => Math.max(max, t.id), 0) + 1;
         selectedTriggerId = triggers.length ? triggers[0].id : null;
         $("target-method-manual").checked = !!$("target-custom").value && !sessionsList.includes($("target-custom").value);
         $("target-method-session").checked = !$("target-method-manual").checked;
@@ -668,8 +701,13 @@ async function init() {
     }
 
     // ── 触发器：按编号分组的槽位与参数面板 ──
-    function activeTriggers() { return triggers.filter(t => ACTIVE_TYPES.includes(t.type)); }
-    function passiveTriggers() { return triggers.filter(t => PASSIVE_TYPES.includes(t.type)); }
+    function activeTriggers() { return triggers.filter(t => ACTIVE_TYPES.includes(t.type)).sort((a, b) => a.id - b.id); }
+    function passiveTriggers() { return triggers.filter(t => PASSIVE_TYPES.includes(t.type)).sort((a, b) => a.id - b.id); }
+    function newTriggerId() {
+        lastTriggerTimestamp = Math.max(Date.now(), lastTriggerTimestamp + 1);
+        while (triggers.some(t => t.id === lastTriggerTimestamp)) lastTriggerTimestamp++;
+        return lastTriggerTimestamp;
+    }
 
     function defaultConfigFor(type) {
         if (type === "interval") return { base_time: defaultBaseTime(), days: 0, hours: 1, minutes: 0 };
@@ -689,7 +727,8 @@ async function init() {
     }
 
     function renderTriggerCanvas() {
-        const render = items => items.map(t => `<button type="button" class="rule-row tnode${t.id === selectedTriggerId ? ' selected' : ''}" data-tid="${escapeHtml(t.id)}" aria-pressed="${t.id === selectedTriggerId}"><span class="rule-number">#${escapeHtml(t.id)}</span><span>${escapeHtml(TYPE_INFO[t.type].label)}</span></button>`).join("");
+        const labels = triggerLabels(triggers);
+        const render = items => items.map(t => `<button type="button" class="rule-row tnode${t.id === selectedTriggerId ? ' selected' : ''}" data-tid="${escapeHtml(t.id)}" aria-pressed="${t.id === selectedTriggerId}"><span class="rule-number">${labels[t.id]}</span><span>${escapeHtml(TYPE_INFO[t.type].label)}</span></button>`).join("");
         $("active-trigger-list").innerHTML = render(activeTriggers());
         $("passive-trigger-list").innerHTML = render(passiveTriggers());
         $("trigger-canvas").querySelectorAll("[data-tid]").forEach(button => button.addEventListener("click", () => {
@@ -710,7 +749,7 @@ async function init() {
         const info = TYPE_INFO[t.type];
         const options = (info.kind === "active" ? ACTIVE_TYPES : PASSIVE_TYPES)
             .map(k => `<option value="${k}" ${k === t.type ? 'selected' : ''}>${TYPE_INFO[k].label}</option>`).join("");
-        panel.innerHTML = `<div class="rule-property"><div class="trigger-panel-header"><h3><span class="heading-id">#${escapeHtml(t.id)}</span> ${escapeHtml(info.label)}</h3></div><p class="field-hint trigger-type-desc">${escapeHtml(info.desc)}</p><div class="field"><label for="panel-type-select">触发器类型</label><select id="panel-type-select">${options}</select></div>${renderTriggerFields(t)}<div class="trigger-next-fire" id="panel-next-fire"></div></div><div class="rule-delete-row"><button class="btn btn-danger" type="button" id="panel-delete-btn">删除此触发器</button></div>`;
+        panel.innerHTML = `<div class="rule-property"><div class="trigger-panel-header"><h3><span class="heading-id">${triggerLabels(triggers)[t.id]}</span> ${escapeHtml(info.label)}</h3></div><p class="field-hint trigger-type-desc">${escapeHtml(info.desc)}</p><div class="field"><label for="panel-type-select">触发器类型</label><select id="panel-type-select">${options}</select></div>${renderTriggerFields(t)}<div class="trigger-next-fire" id="panel-next-fire"></div></div><div class="rule-delete-row"><button class="btn btn-danger" type="button" id="panel-delete-btn">删除此触发器</button></div>`;
         $("panel-type-select").addEventListener("change", e => {
             t._configs = t._configs || {};
             t._configs[t.type] = JSON.parse(JSON.stringify(t.config));
@@ -789,7 +828,7 @@ async function init() {
 
     function addTrigger(kind) {
         const type = kind === "active" ? "interval" : "window";
-        const t = { id: nextTriggerId++, type, config: defaultConfigFor(type) };
+        const t = { id: newTriggerId(), type, config: defaultConfigFor(type) };
         triggers.push(t);
         selectedTriggerId = t.id;
         renderTriggerCanvas();
@@ -858,7 +897,7 @@ async function init() {
     }
     $("task-mode").addEventListener("change", updateContentMode);
 
-    // ── 触发器实时校验 + 下次检查触发时间 ──
+    // ── 触发器实时校验 + 下次任务时间 ──
     function scheduleValidate() {
         clearTimeout(validateTimer);
         ++validateRevision;
@@ -868,15 +907,21 @@ async function init() {
         const el = $("next-fire-hint");
         if (!activeTriggers().length) {
             el.textContent = "无主动型触发器，任务不会自动触发";
-            el.style.color = "var(--color-danger)";
+            el.style.color = "var(--color-danger-text)";
             return;
         }
-        el.textContent = lastValidate.next_fire
-            ? "下次检查：" + fmtTs(lastValidate.next_fire)
-            : "下次检查：待计算…";
-        el.style.color = "var(--text-secondary)";
+        if (lastValidate.next_fire) {
+            el.textContent = "下次任务时间：" + fmtTs(lastValidate.next_fire) + " " + probabilityText(lastValidate.execution_probability);
+        } else if (lastValidate.execution_probability === 0) {
+            el.textContent = "下次任务时间：不会执行（概率 0%）";
+        } else if ((lastValidate.triggers || []).some(t => !t.ok)) {
+            el.textContent = "下次任务时间：请修正触发器配置";
+        } else {
+            el.textContent = lastValidate.now ? "下次任务时间：无可执行的未来时间" : "下次任务时间：待计算…";
+        }
+        el.style.color = "var(--color-primary-text)";
     }
-    function updatePanelNextFire() {
+    function updatePanelNextFire(flash = false) {
         const el = $("panel-next-fire");
         const t = triggers.find(x => x.id === selectedTriggerId);
         if (!el || !t) return;
@@ -901,6 +946,10 @@ async function init() {
         const fires = (r && r.future_fires) || [];
         el.innerHTML = fires.length ? `<h4>未来三次检查</h4>${fires.map(f => `<time>${fmtTs(f)}</time>`).join("")}` : "未来检查：请完成配置…";
         el.className = fires.length ? "trigger-next-fire active" : "trigger-next-fire";
+        if (flash && fires.length) {
+            void el.offsetWidth; // 重启动画，连续刷新也从主题底色开始。
+            el.classList.add("refreshed");
+        }
     }
     function updateCanvasErrors() {
         (lastValidate.triggers || []).forEach(r => {
@@ -913,12 +962,13 @@ async function init() {
         const revision = validateRevision;
         const payload = triggers.map(t => ({ id: t.id, type: t.type, config: t.config }));
         try {
-            const res = await bridge.apiPost("validate", { triggers: payload });
+            const res = await bridge.apiPost("validate", { triggers: payload, task_id: $("task-id").value || undefined });
             if (revision !== validateRevision || !modal.open) return;
             if (!res || res.status !== "success") return;
             lastValidate = res.results || { triggers: [], next_fire: null };
+            if (Number.isFinite(lastValidate.last_success_time)) lastSuccessTime = lastValidate.last_success_time;
             updateValidateHints();
-            updatePanelNextFire();
+            updatePanelNextFire(true);
             updateCanvasErrors();
         } catch (e) { /* 静默 */ }
     }
@@ -954,15 +1004,14 @@ async function init() {
 
         const raw = Array.isArray(obj.triggers) ? obj.triggers : [];
         const unknown = raw.filter(t => !t || !TYPE_INFO[t.type]).length;
-        triggers = raw.filter(t => t && TYPE_INFO[t.type]).map((t, i) => ({
-            id: Number.isInteger(t.id) && t.id > 0 ? t.id : i + 1,
+        triggers = raw.filter(t => t && TYPE_INFO[t.type]).map(t => ({
+            id: Number.isSafeInteger(t.id) && t.id > 0 ? t.id : newTriggerId(),
             type: t.type,
             config: normalizeDurationConfig(t.type, (t.config && typeof t.config === "object" && !Array.isArray(t.config)) ? t.config : {}),
         }));
         $("target-custom").value = obj.target || "";
         renderTargetPicker();
         updateEditorName();
-        nextTriggerId = triggers.reduce((max, t) => Math.max(max, t.id), 0) + 1;
         selectedTriggerId = triggers.length ? triggers[0].id : null;
 
         renderTriggerCanvas();
@@ -1154,15 +1203,18 @@ async function init() {
     // ── 初始化 ──
     await loadSessions();
     await loadData();
-    setInterval(() => {
-        if (document.hidden) return;
-        document.querySelectorAll("[data-next-fire]").forEach(el => { el.textContent = remainingTime(el.dataset.nextFire); });
-    }, 60000);
-    setInterval(() => {
-        if (document.hidden) return;
-        if ($("view-logs").classList.contains("active")) loadRunLogs(logsPage);
-        if ($("view-tasks").classList.contains("active") && !modal.classList.contains("active") && $("task-menu").hidden) loadData();
-    }, 8000);
+    let autoRefreshBusy = false;
+    setInterval(async () => {
+        if (document.hidden || autoRefreshBusy) return;
+        autoRefreshBusy = true;
+        try {
+            if (modal.open) { if (!jsonMode) await doValidate(); return; }
+            document.querySelectorAll("[data-next-fire]").forEach(el => { el.textContent = remainingTime(el.dataset.nextFire); });
+            if ($("view-logs").classList.contains("active")) await loadRunLogs(logsPage);
+            if ($("view-llm").classList.contains("active")) await loadLlmLogs(llmPage, true);
+            if (($("view-tasks").classList.contains("active") && $("task-menu").hidden) || $("view-settings").classList.contains("active")) await loadData();
+        } finally { autoRefreshBusy = false; }
+    }, AUTO_REFRESH_INTERVAL_MS);
 }
 
 if (document.readyState === "complete" || document.readyState === "interactive") init();

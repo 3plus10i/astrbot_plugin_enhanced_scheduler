@@ -188,6 +188,43 @@ class PreviewTests(unittest.TestCase):
         ]
         self.assertIsNone(core.next_trigger_preview(triggers, self.at(1, 1, 9, 0)))
 
+    def test_task_preview_combines_active_passive_and_random_conditions(self):
+        now = self.at(1, 1, 2, 0)
+        triggers = [self.interval(5),
+                    {"id": 2, "type": "interval", "config": {"base_time": "2026-01-01T00:00:00", "minutes": 3}},
+                    {"id": 3, "type": "window", "config": {"start": "08:00", "end": "09:00"}},
+                    {"id": 4, "type": "window", "config": {"start": "08:30", "end": "10:00"}},
+                    {"id": 5, "type": "cooldown", "config": {"hours": 7}},
+                    {"id": 6, "type": "random", "config": {"threshold": 0.5}},
+                    {"id": 7, "type": "random", "config": {"threshold": 0.5}}]
+        # 冷却在 08:46 到期，最快的主动条件在 08:48 到点；不实际采样随机数。
+        success = self.at(1, 1, 1, 46)
+        with patch.object(core._random, "random", side_effect=AssertionError("预览不能采样")):
+            preview = core.next_task_preview(triggers, now, success)
+        self.assertEqual(preview["next_fire"], self.at(1, 1, 8, 48))
+        self.assertEqual(preview["execution_probability"], 0.25)
+        self.assertEqual(core.next_task_preview([self.interval(5)], now)["execution_probability"], 1)
+
+    def test_task_preview_zero_probability_and_invalid_conditions(self):
+        triggers = [self.interval(5), {"id": 2, "type": "random", "config": {"threshold": 0}}]
+        preview = core.next_task_preview(triggers, self.at(1, 1, 2, 0))
+        self.assertIsNone(preview["next_fire"])
+        self.assertEqual(preview["execution_probability"], 0)
+        triggers[1]["config"]["threshold"] = 2
+        preview = core.next_task_preview(triggers, self.at(1, 1, 2, 0))
+        self.assertIsNone(preview["next_fire"])
+        self.assertIsNone(preview["execution_probability"])
+
+    def test_trigger_labels_sort_each_group_and_keep_ids(self):
+        stamp = 1791710000000
+        triggers = [{"id": stamp + 4, "type": "random"}, {"id": stamp + 3, "type": "cron"},
+                    {"id": stamp + 1, "type": "interval"}, {"id": stamp + 2, "type": "window"}]
+        original = copy.deepcopy(triggers)
+        self.assertEqual(core.trigger_labels(triggers), {stamp + 1: "A1", stamp + 3: "A2", stamp + 2: "B1", stamp + 4: "B2"})
+        self.assertEqual(triggers, original)
+        triggers = [tg for tg in triggers if tg["id"] != stamp + 2]
+        self.assertEqual(core.trigger_labels(triggers)[stamp + 4], "B1")
+
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -291,6 +328,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await until(lambda: len(self.store.run_logs) == 1)
         self.assertEqual(self.executor.calls, [])
         self.assertEqual(self.store.run_logs[0]["action"], "skipped")
+        log = self.store.run_logs[0]
+        self.assertEqual(log["trigger_labels"], {1: "A1", 2: "B1"})
+        definition["triggers"].pop()
+        self.assertEqual(log["trigger_labels"], {1: "A1", 2: "B1"})
         self.assertEqual(definition["last_success_time"], 0)
 
     async def test_cooldown_defers_worker_instead_of_logging_skips(self):
@@ -704,6 +745,49 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 400)
         self.assertIn("不再支持", response["message"])
         self.assertEqual(self.plugin.store.tasks, {})
+
+    async def test_task_time_previews_use_saved_cooldown_and_probability(self):
+        now = PreviewTests.at(1, 1, 2, 0)
+        definition = task()
+        definition["last_success_time"] = now
+        definition["triggers"].extend([
+            {"id": 1791710000001, "type": "cooldown", "config": {"hours": 2}},
+            {"id": 1791710000002, "type": "random", "config": {"threshold": 0.5}},
+            {"id": 1791710000003, "type": "random", "config": {"threshold": 0.5}},
+        ])
+        self.plugin.store.tasks["a"] = definition
+        self.request.body = {"task_id": "a", "triggers": definition["triggers"]}
+        with patch.object(main_module.time, "time", return_value=now):
+            data = await self.plugin._api_get_data()
+            validation = (await self.plugin._api_validate())["results"]
+            preview = await self.plugin._api_preview_next()
+        expected = PreviewTests.at(1, 1, 4, 0)
+        self.assertEqual(data["tasks"]["a"]["_next_fire"], expected)
+        self.assertEqual(data["tasks"]["a"]["_execution_probability"], 0.25)
+        for response in (validation, preview):
+            self.assertEqual(response["next_fire"], expected)
+            self.assertEqual(response["execution_probability"], 0.25)
+        self.assertEqual(len(validation["triggers"][0]["future_fires"]), 3)
+
+    async def test_timestamp_ids_are_preserved_and_duplicates_rejected(self):
+        definition = task()
+        stamp = 1791710000000
+        definition["triggers"][0]["id"] = stamp
+        self.request.body = definition
+        self.assertEqual((await self.plugin._api_upsert_task())["status"], "success")
+        self.assertEqual(self.plugin.store.tasks["a"]["triggers"][0]["id"], stamp)
+        for invalid in (True, core.MAX_TRIGGER_ID + 1):
+            self.request.body = copy.deepcopy(definition)
+            self.request.body["triggers"][0]["id"] = invalid
+            self.assertEqual((await self.plugin._api_upsert_task())[1], 400)
+        self.request.body = copy.deepcopy(definition)
+        self.request.body["triggers"].append({"id": stamp, "type": "random", "config": {"threshold": 0.5}})
+        self.assertEqual((await self.plugin._api_upsert_task())[1], 400)
+        self.assertEqual(len(self.plugin.store.tasks["a"]["triggers"]), 1)
+        validation = (await self.plugin._api_validate())["results"]
+        self.assertFalse(validation["triggers"][1]["ok"])
+        self.assertIn("重复", validation["triggers"][1]["msg"])
+        self.assertIsNone(validation["next_fire"])
 
     async def test_task_name_limit_on_create_update_and_copy(self):
         self.request.body = dict(task(), name="中" * 33)

@@ -16,6 +16,7 @@
   /* 交互层次与语义底色均由原始色板混色得到。 */
   --color-primary-hover: color-mix(in srgb, var(--color-primary) 87%, var(--color-black));
   --color-primary-light: color-mix(in srgb, var(--color-primary) 8%, var(--bg-card));
+  --bg-preview-refresh: color-mix(in srgb, var(--color-primary) 30%, var(--bg-card));
   --color-primary-text: var(--color-primary);
   --color-danger-text: var(--color-danger);
   --color-success-text: var(--color-success);
@@ -242,6 +243,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--color-primary)
 #editor-json > .field-hint { margin-bottom: 15px; }
 .editor-footer { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 18px 30px; border-top: 1px solid var(--border-color); background: var(--bg-card); flex: 0 0 auto; }
 .editor-footer .muted { font-size: 12px; }
+#next-fire-hint { font-size: 14px; font-weight: 600; line-height: 1.65; }
 .editor-footer .btn { min-width: 84px; }
 .toast { position: fixed; bottom: 24px; right: 28px; max-width: 500px; padding: 11px 18px; background: var(--bg-toast); color: var(--color-white); border-radius: 6px; box-shadow: var(--shadow-floating); z-index: 5000; font-size: 13px; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; } dialog::backdrop { backdrop-filter: none; } }
@@ -291,6 +293,9 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--color-primary)
 .trigger-next-fire h4 { margin-bottom: 9px; font-size: 12px; color: var(--text-secondary); }
 .trigger-next-fire time { display: block; font-family: Consolas, ui-monospace, monospace; font-size: 13px; line-height: 1.9; white-space: nowrap; }
 .trigger-next-fire.error { color: var(--color-danger-text); }
+.trigger-next-fire.refreshed { animation: next-fire-refresh 1s ease-out; }
+@keyframes next-fire-refresh { from { background-color: var(--bg-preview-refresh); } to { background-color: transparent; } }
+@media (prefers-reduced-motion: reduce) { .trigger-next-fire.refreshed { animation: none; } }
 .confirm-dialog { width: 440px; height: auto; }
 .confirm-body { padding: 0 30px 26px; overflow-wrap: anywhere; }
 .confirm-dialog .editor-footer { justify-content: flex-end; }

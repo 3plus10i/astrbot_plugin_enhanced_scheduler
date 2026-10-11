@@ -239,5 +239,6 @@ class SchedulerRuntime:
         self.store.append_log({
             "time": now, "task_id": task_id, "task_name": task.get("name", ""),
             "trigger_tof": tof, "logic_result": logic, "action": action,
+            "trigger_labels": self.core.trigger_labels(task.get("triggers", [])),
             "target_result": target_result, "detail": detail, "source": source,
         })

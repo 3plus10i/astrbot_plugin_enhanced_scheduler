@@ -9,7 +9,7 @@
 <body>
   <div class="app-container">
     <header class="app-header">
-      <div class="header-title"><h1>增强计划任务</h1><span class="plugin-version">v1.5.1</span></div>
+      <div class="header-title"><h1>增强计划任务</h1><span class="plugin-version">v1.5.2</span></div>
       <nav class="tab-nav" aria-label="插件页面">
         <button type="button" class="tab-btn active" data-tab="tasks" aria-current="page">计划任务</button>
         <button type="button" class="tab-btn" data-tab="logs">运行日志</button>
@@ -22,7 +22,7 @@
         <div class="page-heading"><div class="heading-group"><h2 id="tasks-title">计划任务</h2><span class="muted" id="task-count"></span></div><div class="button-group"><button class="btn btn-secondary" id="refresh-tasks-btn" type="button">刷新</button><button class="btn btn-primary" id="add-task-btn" type="button" disabled>+ 新建任务</button></div></div>
         <div class="table-surface"><table class="data-table tasks-table">
           <colgroup><col class="task-col"><col class="status-col"><col class="rules-col"><col class="next-col"><col class="mode-col"><col class="actions-col"></colgroup>
-          <thead><tr><th scope="col">任务 / 发送对象</th><th scope="col">状态</th><th scope="col">触发规则</th><th scope="col">下次检查</th><th scope="col">执行模式</th><th scope="col">操作</th></tr></thead>
+          <thead><tr><th scope="col">任务 / 发送对象</th><th scope="col">状态</th><th scope="col">触发规则</th><th scope="col">下次任务时间</th><th scope="col">执行模式</th><th scope="col">操作</th></tr></thead>
           <tbody id="tasks-body"><tr><td colspan="6" class="table-empty">正在加载任务…</td></tr></tbody>
         </table></div>
       </section>
@@ -57,8 +57,8 @@
   <dialog id="task-modal" aria-labelledby="modal-title-text">
     <form id="task-form" class="editor-form" novalidate>
       <input type="hidden" id="task-id"><input type="hidden" id="task-action" value="add">
-      <header class="editor-header"><div><h2 id="modal-title-text">新建任务</h2><p id="editor-task-name" hidden></p></div><div class="button-group"><button class="text-btn" id="task-json-toggle" type="button" aria-pressed="false">JSON 模式</button><button class="icon-btn" type="button" id="modal-close-btn" aria-label="关闭任务编辑">×</button></div></header>
-      <div class="editor-tabs" id="editor-tabs" role="tablist" aria-label="任务编辑分区"><button role="tab" id="tab-basic" aria-controls="editor-basic" aria-selected="true" data-editor-tab="basic" type="button">基本信息</button><button role="tab" id="tab-rules" aria-controls="editor-rules" aria-selected="false" data-editor-tab="rules" type="button" tabindex="-1">触发规则</button><button role="tab" id="tab-content" aria-controls="editor-content" aria-selected="false" data-editor-tab="content" type="button" tabindex="-1">消息内容</button></div>
+      <header class="editor-header"><div><h2 id="modal-title-text">新建任务</h2><p id="editor-task-name" hidden></p></div><div class="button-group"><button class="text-btn" id="task-json-toggle" type="button" aria-pressed="false">JSON 模式</button></div></header>
+      <div class="editor-tabs" id="editor-tabs" role="tablist" aria-label="任务编辑分区"><button role="tab" id="tab-basic" aria-controls="editor-basic" aria-selected="true" data-editor-tab="basic" type="button">基本信息</button><button role="tab" id="tab-rules" aria-controls="editor-rules" aria-selected="false" data-editor-tab="rules" type="button" tabindex="-1">触发规则</button><button role="tab" id="tab-content" aria-controls="editor-content" aria-selected="false" data-editor-tab="content" type="button" tabindex="-1">任务内容</button></div>
       <div class="editor-body" id="task-form-body">
         <section id="editor-basic" class="editor-panel" role="tabpanel" aria-labelledby="tab-basic">
           <div class="task-enabled-row"><label class="switch-toggle"><input id="task-enabled" type="checkbox" role="switch" checked><span class="slider"></span></label><label for="task-enabled">启用此任务</label></div>
@@ -79,7 +79,7 @@
           <div class="setting-row compact"><div><label for="task-holiday-aware">节假日感知</label><p>附加工作日与节假日信息。</p></div><label class="switch-toggle"><input id="task-holiday-aware" type="checkbox" role="switch"><span class="slider"></span></label></div>
         </section>
       </div>
-      <div class="editor-body" id="task-json-body" style="display:none"><section class="editor-panel"><div class="field"><label for="task-json">任务 JSON</label><textarea class="json-editor" id="task-json" spellcheck="false"></textarea><span class="field-hint">进阶编辑入口，适合直接查看与调整任务配置。</span></div></section></div>
+      <div class="editor-body" id="task-json-body" style="display:none"><section class="editor-panel"><div class="field"><label for="task-json">任务 JSON</label><span class="field-hint">一般不要修改，除非你知道你在做什么。</span><textarea class="json-editor" id="task-json" spellcheck="false"></textarea></div></section></div>
       <footer class="editor-footer"><span class="muted" id="next-fire-hint"></span><div class="button-group"><button class="btn btn-secondary" type="button" id="modal-cancel-btn">取消</button><button class="btn btn-primary" type="submit" id="modal-submit-btn">保存任务</button></div></footer>
     </form>
   </dialog>

@@ -48,7 +48,7 @@ def _copy_task_name(source_name: str, existing_names: set[str]) -> str:
         number += 1
 
 
-@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，主动取或、被动取且的多触发器组合。", "1.5.1")
+@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，主动取或、被动取且的多触发器组合。", "1.5.2")
 class EnhancedSchedulerPlugin(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):
         super().__init__(context)
@@ -93,21 +93,19 @@ class EnhancedSchedulerPlugin(Star):
         from quart import jsonify
         resp = {"status": "success", "config": self.config,
                 "limits": {"task_name_max_length": TASK_NAME_MAX_LENGTH}}
-        # 预计算每个任务的下次主动触发时间，供前端直接展示（无需逐行异步请求）
+        # 预计算下一次可执行机会与联合概率，纳入所有主动、被动条件。
         now = time.time()
         tasks_out = {}
         for tid, t in self.store.data.get("tasks", {}).items():
             t_copy = copy.deepcopy(t)
             t_copy["_runtime"] = self.runtime.status(tid)
             try:
-                t_copy["_next_fire"] = (
-                    core.next_trigger_preview(
-                        t.get("triggers", []), now, float(t.get("last_success_time", 0) or 0)
-                    )
-                    if t_copy["_runtime"]["state"] in ("waiting", "running") else None
-                )
+                preview = core.next_task_preview(t.get("triggers", []), now, float(t.get("last_success_time", 0) or 0))
+                t_copy["_next_fire"] = preview["next_fire"] if t_copy["_runtime"]["state"] in ("waiting", "running") else None
+                t_copy["_execution_probability"] = preview["execution_probability"]
             except Exception:
                 t_copy["_next_fire"] = None
+                t_copy["_execution_probability"] = None
             tasks_out[tid] = t_copy
         resp["tasks"] = tasks_out
         return jsonify(resp)
@@ -212,19 +210,21 @@ class EnhancedSchedulerPlugin(Star):
         now = time.time()
         norm_triggers = []
         seen_ids = set()
+        labels = core.trigger_labels(triggers)
         for tg in triggers:
             if not isinstance(tg, dict):
                 return False, "触发器格式错误", ""
             if "last_fired" in tg:
                 return False, "不再支持触发器 last_fired 字段", ""
             tid = tg.get("id")
-            if not isinstance(tid, int) or tid < 1:
-                return False, f"触发器 id 必须是正整数（收到 {tid}）", ""
+            if isinstance(tid, bool) or not isinstance(tid, int) or not 1 <= tid <= core.MAX_TRIGGER_ID:
+                return False, f"触发器 id 必须是可精确表示的正整数（收到 {tid}）", ""
             if tid in seen_ids:
                 return False, f"触发器 id {tid} 重复", ""
             seen_ids.add(tid)
+            label = labels.get(tid, str(tid))
             if not isinstance(tg.get("config", {}), dict):
-                return False, f"触发器 {tid}: config 必须是对象", ""
+                return False, f"触发器 {label}: config 必须是对象", ""
             cfg = dict(tg.get("config", {}))
             # interval 触发器缺省 base_time 时，默认设为创建/保存当天的 0 点
             if tg.get("type") == "interval" and not str(cfg.get("base_time", "")).strip():
@@ -236,7 +236,7 @@ class EnhancedSchedulerPlugin(Star):
             }
             ok, msg = core.validate_trigger(norm_tg)
             if not ok:
-                return False, f"触发器 {tid}: {msg}", ""
+                return False, f"触发器 {label}: {msg}", ""
             norm_triggers.append(norm_tg)
 
         # 固定语义：主动型之间取或、被动型之间取且 —— 没有主动触发器则永远不会触发
@@ -371,8 +371,13 @@ class EnhancedSchedulerPlugin(Star):
 
             triggers = req.get("triggers", []) or []
             now = time.time()
+            seen_ids = set()
             for tg in triggers:
                 ok, msg = core.validate_trigger(tg)
+                if ok and tg["id"] in seen_ids:
+                    ok, msg = False, "触发器 ID 重复"
+                if ok:
+                    seen_ids.add(tg["id"])
                 entry = {"id": tg.get("id"), "ok": ok, "msg": msg, "future_fires": None}
                 if ok:
                     if tg.get("type") in core.ACTIVE_TYPES:
@@ -381,8 +386,9 @@ class EnhancedSchedulerPlugin(Star):
                         entry["future_fires"] = core.future_fires(tg, now, 3)
                 results["triggers"].append(entry)
 
-            # 下次检查触发时间（触发器组级别，仅主动触发器）
-            results["next_fire"] = core.next_trigger_preview(triggers, now)
+            task = self.store.tasks.get(str(req.get("task_id", "")), {})
+            results["last_success_time"] = float(task.get("last_success_time", 0) or 0)
+            results.update(core.next_task_preview(triggers, now, results["last_success_time"]))
             results["now"] = now
             return jsonify({"status": "success", "results": results})
         except Exception as e:
@@ -397,17 +403,10 @@ class EnhancedSchedulerPlugin(Star):
             if not isinstance(req, dict):
                 return jsonify({"status": "error", "message": "请求体必须是 JSON 对象"}), 400
             triggers = req.get("triggers", []) or []
-            norm_triggers = []
-            for tg in triggers:
-                if core.validate_trigger(tg)[0]:
-                    norm_triggers.append({
-                        "id": tg.get("id"),
-                        "type": tg.get("type"),
-                        "config": tg.get("config", {}),
-                    })
             now = time.time()
-            nf = core.next_trigger_preview(norm_triggers, now)
-            return jsonify({"status": "success", "next_fire": nf, "now": now})
+            task = self.store.tasks.get(str(req.get("task_id", "")), {})
+            preview = core.next_task_preview(triggers, now, float(task.get("last_success_time", 0) or 0))
+            return jsonify({"status": "success", **preview, "now": now})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
 
