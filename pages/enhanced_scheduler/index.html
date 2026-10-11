@@ -1,268 +1,92 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>增强计划任务 - 插件管理</title>
-    <link rel="stylesheet" href="style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>增强计划任务</title>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <div class="app-container">
-        <header class="app-header">
-            <div class="header-left">
-                <span class="back-btn" id="back-btn">← 返回</span>
-                <h1 class="page-title">增强计划任务</h1>
-                <span class="plugin-version">v1.4.3</span>
-            </div>
-            <div class="header-right">
-                <div class="tab-nav">
-                    <button class="tab-btn active" data-tab="tasks"><span>计划任务</span></button>
-                    <button class="tab-btn" data-tab="logs"><span>运行日志</span></button>
-                    <button class="tab-btn" data-tab="llm"><span>LLM 调用日志</span></button>
-                    <button class="tab-btn" data-tab="settings"><span>插件设置</span></button>
-                </div>
-            </div>
-        </header>
-
-        <main class="app-content">
-            <!-- 计划任务 -->
-            <section id="view-tasks" class="tab-view active">
-                <div class="card">
-                    <div class="card-header">
-                        <div class="card-header-title-group">
-                            <h2 class="card-title">计划任务列表</h2>
-                        </div>
-                        <button class="btn btn-primary" id="add-task-btn"><span>+ 新增任务</span></button>
-                    </div>
-                    <div class="card-body table-responsive">
-                        <table class="data-table">
-                            <thead>
-                                <tr>
-                                    <th>名称</th>
-                                    <th>状态</th>
-                                    <th>触发器</th>
-                                    <th>预计下次触发</th>
-                                    <th>内容</th>
-                                    <th>发送对象</th>
-                                    <th>操作</th>
-                                </tr>
-                            </thead>
-                            <tbody id="tasks-body">
-                                <tr><td colspan="7" class="table-empty">暂无计划任务，点击右上角新增。</td></tr>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </section>
-
-            <!-- 运行日志 -->
-            <section id="view-logs" class="tab-view">
-                <div class="card">
-                    <div class="card-header">
-                        <div class="card-header-title-group">
-                            <h2 class="card-title">运行日志</h2>
-                        </div>
-                        <button class="btn btn-secondary" id="refresh-logs-btn"><span>刷新</span></button>
-                    </div>
-                    <div class="card-body table-responsive">
-                        <table class="data-table">
-                            <thead>
-                                <tr>
-                                    <th>时间</th>
-                                    <th>任务</th>
-                                    <th>触发器结果</th>
-                                    <th>条件结果</th>
-                                    <th>动作</th>
-                                    <th>详情</th>
-                                </tr>
-                            </thead>
-                            <tbody id="logs-body">
-                                <tr><td colspan="6" class="table-empty">暂无日志。任务触发后会在此显示最近记录。</td></tr>
-                            </tbody>
-                        </table>
-                    </div>
-                    <div class="pager" id="logs-pager"></div>
-                </div>
-            </section>
-
-            <!-- LLM 调用日志 -->
-            <section id="view-llm" class="tab-view">
-                <div class="card">
-                    <div class="card-header">
-                        <div class="card-header-title-group">
-                            <h2 class="card-title">LLM 调用日志</h2>
-                        </div>
-                        <div style="display:flex;gap:8px;">
-                            <button class="btn btn-secondary" id="refresh-llm-btn"><span>刷新</span></button>
-                            <button class="btn btn-danger" id="clear-llm-btn"><span>清空</span></button>
-                        </div>
-                    </div>
-                    <div class="card-body">
-                        <div class="llm-log-list" id="llm-log-list"><div class="empty-hint">暂无记录。</div></div>
-                        <div class="pager" id="llm-pager"></div>
-                    </div>
-                </div>
-            </section>
-
-            <!-- 插件设置 -->
-            <section id="view-settings" class="tab-view">
-                <form id="config-form" onsubmit="return false;">
-                    <div class="card">
-                        <div class="card-header"><div class="card-header-title-group"><h2 class="card-title">基础配置</h2></div></div>
-                        <div class="card-body">
-                            <div class="form-group">
-                                <label class="form-label">日志保留条数</label>
-                                <input type="number" class="form-input" id="config-log-retention" min="10" max="5000" required>
-                                <span class="form-hint">内存中保留最近多少条触发/执行日志。</span>
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">AI 生成超时(秒)</label>
-                                <input type="number" class="form-input" id="config-llm-timeout" min="5" max="600" required>
-                                <span class="form-hint">任务内容标记为需要 AI 处理时，单次生成的最大等待时长。</span>
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">LLM 调用日志保留条数</label>
-                                <input type="number" class="form-input" id="config-llm-log-retention" min="10" max="10000" required>
-                                <span class="form-hint">日志目录中保留最近多少条 AI 请求/回复记录（一条记录一个文件，含完整请求体与图片）。</span>
-                            </div>
-                            <div style="display:flex;justify-content:flex-end;margin-top:16px;">
-                                <button class="btn btn-primary" id="save-config-btn" type="submit"><span>保存配置</span></button>
-                            </div>
-                        </div>
-                    </div>
-                </form>
-            </section>
-        </main>
-    </div>
-
-    <!-- 任务编辑弹窗 -->
-    <div class="modal-overlay" id="task-modal">
-        <div class="modal-container modal-wide">
-            <header class="modal-header">
-                <h3 class="modal-title" id="modal-title-text">新增计划任务</h3>
-                <div class="modal-header-actions">
-                    <button class="btn btn-secondary btn-sm" type="button" id="task-json-toggle"><span>JSON 模式</span></button>
-                    <span class="modal-close" id="modal-close-btn">×</span>
-                </div>
-            </header>
-            <form id="task-form" onsubmit="return false;">
-                <input type="hidden" id="task-id">
-                <input type="hidden" id="task-action" value="add">
-                <div class="modal-body" id="task-json-body" style="display:none;">
-                    <div class="form-group">
-                        <label class="form-label">任务 JSON（进阶）</label>
-                        <textarea class="form-input json-editor" id="task-json" spellcheck="false"></textarea>
-                        <span class="form-hint json-warning">除非你知道你在做什么，否则不要修改 JSON 配置。</span>
-                    </div>
-                </div>
-                <div class="modal-body" id="task-form-body">
-                    <!-- 基本信息 -->
-                    <div class="form-group">
-                        <label class="form-label">任务名称</label>
-                        <input type="text" class="form-input" id="task-name" placeholder="例如：喝水提醒" required>
-                    </div>
-                    <div class="form-group row-align">
-                        <div class="form-label-desc">
-                            <label class="form-label">启用此任务</label>
-                            <span class="form-hint">关闭后保留配置但不触发</span>
-                        </div>
-                        <label class="switch-toggle"><input type="checkbox" id="task-enabled" checked><span class="slider"></span></label>
-                    </div>
-
-                    <!-- 发送对象 -->
-                    <div class="form-group">
-                        <label class="form-label">发送对象</label>
-                        <div class="umo-picker">
-                            <select class="form-input" id="target-select">
-                                <option value="">选择活跃会话…</option>
-                            </select>
-                            <input type="text" class="form-input" id="target-custom" placeholder="选择上方会话，或在此输入完整 UMO">
-                        </div>
-                        <span class="form-hint">每个任务只允许一个目标对话；选择会话会替换当前目标。空动作可留空。</span>
-                    </div>
-
-                    <!-- 触发器（图形化） -->
-                    <div class="section-block">
-                        <div class="section-block-header">
-                            <div>
-                                <label class="form-label">触发器设置</label>
-                                <span class="form-hint">任意主动型触发，并且后续所有被动型激活，则可触发一次任务。</span>
-                            </div>
-                        </div>
-                        <div class="trigger-canvas-viewport" id="trigger-canvas-viewport">
-                            <div class="trigger-canvas" id="trigger-canvas"></div>
-                        </div>
-                        <div class="trigger-canvas-actions">
-                            <button class="btn btn-sm" id="add-active-trigger-btn" type="button"><span>+ 新建主动型触发器</span></button>
-                            <button class="btn btn-sm" id="add-passive-trigger-btn" type="button"><span>+ 新建被动型触发器</span></button>
-                            <span class="next-fire-inline" id="next-fire-hint"></span>
-                        </div>
-                        <div class="trigger-panel" id="trigger-panel"></div>
-                    </div>
-
-                    <!-- 任务内容 -->
-                    <div class="section-block">
-                        <div class="section-block-header">
-                            <div><label class="form-label">任务内容</label></div>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">执行模式</label>
-                            <select class="form-input" id="task-mode">
-                                <option value="fixed">发送文本到对话</option>
-                                <option value="standalone">调用独立 AI 回复</option>
-                                <option value="conversation">调用对话配置的 AI 回复</option>
-                            </select>
-                            <span class="form-hint" id="content-mode-detail"></span>
-                        </div>
-                        <div class="form-group" id="system-prompt-group">
-                            <label class="form-label">独立 AI 系统提示（仅「调用独立 AI 回复」模式生效，每个任务独立）</label>
-                            <textarea class="form-input" id="task-system-prompt"></textarea>
-                            <span class="form-hint">作为该任务独立调用 AI 的 system prompt，不与对话人格、其他插件互动。可留空。</span>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label" id="task-text-label">任务提示词</label>
-                            <textarea class="form-input" id="task-text"></textarea>
-                            <div class="form-group row-align" style="margin:0;">
-                                <div class="form-label-desc">
-                                    <label class="form-label">时间感知</label>
-                                    <span class="form-hint">开启后触发时会把当前时间（年月日 周几 时分秒）附加给 AI（仅两种 AI 模式生效）。</span>
-                                </div>
-                                <label class="switch-toggle"><input type="checkbox" id="task-time-aware" checked><span class="slider"></span></label>
-                            </div>
-                            <div class="form-group row-align" style="margin:0;">
-                                <div class="form-label-desc">
-                                    <label class="form-label">节假日感知</label>
-                                    <span class="form-hint">开启后附加工作日/节假日信息（含调休，需联网查询，仅两种 AI 模式生效）。</span>
-                                </div>
-                                <label class="switch-toggle"><input type="checkbox" id="task-holiday-aware"><span class="slider"></span></label>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                <footer class="modal-footer">
-                    <button class="btn btn-secondary" type="button" id="modal-cancel-btn">取消</button>
-                    <button class="btn btn-primary" type="submit" id="modal-submit-btn">保存</button>
-                </footer>
-            </form>
+  <div class="app-container">
+    <header class="app-header">
+      <div class="header-title"><h1>增强计划任务</h1><span class="plugin-version">v1.5.0</span></div>
+      <nav class="tab-nav" aria-label="插件页面">
+        <button type="button" class="tab-btn active" data-tab="tasks" aria-current="page">计划任务</button>
+        <button type="button" class="tab-btn" data-tab="logs">运行日志</button>
+        <button type="button" class="tab-btn" data-tab="llm">LLM 调用日志</button>
+        <button type="button" class="tab-btn" data-tab="settings">设置</button>
+      </nav>
+    </header>
+    <main class="app-content">
+      <section id="view-tasks" class="tab-view active" aria-labelledby="tasks-title">
+        <div class="page-heading"><div class="heading-group"><h2 id="tasks-title">计划任务</h2><span class="muted" id="task-count"></span></div><div class="button-group"><button class="btn btn-secondary" id="refresh-tasks-btn" type="button">刷新</button><button class="btn btn-primary" id="add-task-btn" type="button">+ 新建任务</button></div></div>
+        <div class="table-surface"><table class="data-table tasks-table">
+          <colgroup><col class="task-col"><col class="status-col"><col class="rules-col"><col class="next-col"><col class="mode-col"><col class="actions-col"></colgroup>
+          <thead><tr><th scope="col">任务 / 发送对象</th><th scope="col">状态</th><th scope="col">触发规则</th><th scope="col">下次检查</th><th scope="col">执行模式</th><th scope="col">操作</th></tr></thead>
+          <tbody id="tasks-body"><tr><td colspan="6" class="table-empty">正在加载任务…</td></tr></tbody>
+        </table></div>
+      </section>
+      <section id="view-logs" class="tab-view" aria-labelledby="logs-title">
+        <div class="page-heading"><h2 id="logs-title">运行日志</h2><button class="btn btn-secondary" id="refresh-logs-btn" type="button">刷新</button></div>
+        <div class="table-surface"><table class="data-table logs-table">
+          <colgroup><col class="log-time-col"><col class="log-task-col"><col class="log-trigger-col"><col class="log-action-col"><col></colgroup>
+          <thead><tr><th scope="col">精确时间</th><th scope="col">任务</th><th scope="col">触发情况</th><th scope="col">动作</th><th scope="col">详情</th></tr></thead>
+          <tbody id="logs-body"><tr><td colspan="5" class="table-empty">暂无运行日志。</td></tr></tbody>
+        </table></div><div class="pager" id="logs-pager"></div>
+      </section>
+      <section id="view-llm" class="tab-view" aria-labelledby="llm-title">
+        <div class="llm-section">
+          <div class="llm-section-header"><h2 id="llm-title">LLM 调用日志</h2><div class="button-group"><button class="btn btn-secondary" id="refresh-llm-btn" type="button">刷新</button><button class="btn btn-quiet-danger" id="clear-llm-btn" type="button">清空</button></div></div>
+          <div class="llm-log-list" id="llm-log-list"><div class="empty-hint">暂无记录。</div></div><div class="pager" id="llm-pager"></div>
         </div>
-    </div>
-
-    <!-- 确认弹窗 -->
-    <div class="modal-overlay" id="confirm-modal-overlay">
-        <div class="modal-container" style="max-width:400px;">
-            <header class="modal-header"><h3 class="modal-title">确认操作</h3></header>
-            <div class="modal-body"><p id="confirm-modal-text" style="font-size:15px;line-height:1.5;">确定？</p></div>
-            <footer class="modal-footer">
-                <button class="btn btn-secondary" type="button" id="confirm-modal-cancel-btn">取消</button>
-                <button class="btn btn-danger" type="button" id="confirm-modal-ok-btn">确定</button>
-            </footer>
-        </div>
-    </div>
-
-    <div class="toast" id="toast">操作成功</div>
-
-    <div class="b64-popover" id="b64-popover"></div>
-
-    <script src="index.js"></script>
+      </section>
+      <section id="view-settings" class="tab-view" aria-labelledby="settings-title">
+        <div class="page-heading"><h2 id="settings-title">插件设置</h2></div>
+        <form id="config-form" class="settings-form">
+          <h3 class="setting-section-title">执行</h3>
+          <div class="setting-row"><div><label for="config-llm-timeout">AI 生成超时</label><p>超过等待时间后，本次执行记为失败。</p></div><div class="unit-input"><input id="config-llm-timeout" type="number" min="5" max="600" step="1" required><span>秒</span></div></div>
+          <h3 class="setting-section-title">日志</h3>
+          <div class="setting-row"><div><label for="config-log-retention">运行日志保留条数</label><p>保留最近的任务触发与执行记录。</p></div><div class="unit-input"><input id="config-log-retention" type="number" min="10" max="5000" step="1" required><span>条</span></div></div>
+          <div class="setting-row"><div><label for="config-llm-log-retention">LLM 调用日志保留条数</label><p>包含请求、回复与图片，建议少量保留。</p></div><div class="unit-input"><input id="config-llm-log-retention" type="number" min="10" max="10000" step="1" required><span>条</span></div></div>
+          <div class="settings-footer"><span class="settings-hint" id="config-dirty-hint" role="status" hidden>有未保存的修改</span><button class="btn btn-secondary" id="save-config-btn" type="submit">保存配置</button></div>
+        </form>
+      </section>
+    </main>
+  </div>
+  <div id="task-menu" class="floating-menu" hidden aria-label="任务更多操作"></div>
+  <dialog id="task-modal" aria-labelledby="modal-title-text">
+    <form id="task-form" class="editor-form" novalidate>
+      <input type="hidden" id="task-id"><input type="hidden" id="task-action" value="add">
+      <header class="editor-header"><div><h2 id="modal-title-text">新建任务</h2><p id="editor-task-name" hidden></p></div><div class="button-group"><button class="text-btn" id="task-json-toggle" type="button" aria-pressed="false">JSON 模式</button><button class="icon-btn" type="button" id="modal-close-btn" aria-label="关闭任务编辑">×</button></div></header>
+      <div class="editor-tabs" id="editor-tabs" role="tablist" aria-label="任务编辑分区"><button role="tab" id="tab-basic" aria-controls="editor-basic" aria-selected="true" data-editor-tab="basic" type="button">基本信息</button><button role="tab" id="tab-rules" aria-controls="editor-rules" aria-selected="false" data-editor-tab="rules" type="button" tabindex="-1">触发规则</button><button role="tab" id="tab-content" aria-controls="editor-content" aria-selected="false" data-editor-tab="content" type="button" tabindex="-1">消息内容</button></div>
+      <div class="editor-body" id="task-form-body">
+        <section id="editor-basic" class="editor-panel" role="tabpanel" aria-labelledby="tab-basic">
+          <div class="task-enabled-row"><label class="switch-toggle"><input id="task-enabled" type="checkbox" role="switch" checked><span class="slider"></span></label><label for="task-enabled">启用此任务</label></div>
+          <div class="field"><label for="task-name">任务名称</label><input id="task-name" class="form-input" placeholder="例如：喝水提醒" autocomplete="off" maxlength="32" required aria-describedby="task-name-count"><div class="name-hint field-hint"><span id="task-name-count">0 / 32</span></div></div>
+          <div class="field target-field"><label for="target-select">发送对象</label><div class="target-method"><label><input id="target-method-session" type="radio" name="target-method" checked>选择会话</label><label><input id="target-method-manual" type="radio" name="target-method">手动输入 UMO</label></div><select id="target-select" class="form-input"><option value="">不指定发送对象</option></select><input id="target-custom" class="form-input" placeholder="平台:消息类型:标识" aria-label="手动输入发送对象 UMO" hidden></div>
+          <p class="inline-notice" id="migration-notice" hidden></p>
+        </section>
+        <section id="editor-rules" class="editor-panel" role="tabpanel" aria-labelledby="tab-rules" hidden>
+          <div class="rule-layout"><div class="rule-list-pane" id="trigger-canvas"><p class="field-hint rule-explanation">任一主动触发，且所有被动条件满足时执行。</p>
+            <div class="rule-slot-group"><div class="rule-group-heading">主动触发器</div><div id="active-trigger-list" class="rule-slots"></div><button type="button" class="add-rule-slot" id="add-active-trigger-btn">+ 添加主动触发器</button></div>
+            <div class="rule-slot-group"><div class="rule-group-heading">被动条件</div><div id="passive-trigger-list" class="rule-slots"></div><button type="button" class="add-rule-slot" id="add-passive-trigger-btn">+ 添加被动条件</button></div>
+          </div><div class="rule-properties" id="trigger-panel"></div></div>
+        </section>
+        <section id="editor-content" class="editor-panel" role="tabpanel" aria-labelledby="tab-content" hidden>
+          <div class="field"><label for="task-mode">执行模式</label><select id="task-mode" class="form-input"><option value="fixed">固定文本</option><option value="standalone">独立 AI</option><option value="conversation">对话 AI</option></select><p id="content-mode-detail" class="field-hint"></p></div>
+          <div class="field" id="system-prompt-group"><label for="task-system-prompt">独立 AI 系统提示</label><textarea id="task-system-prompt" class="form-input" rows="3"></textarea><div class="field-hint">仅用于本任务，不注入目标会话的人格与上下文，可留空。</div></div>
+          <div class="field"><label for="task-text" id="task-text-label">任务提示词</label><textarea id="task-text" class="form-input" rows="6"></textarea><div class="field-hint">留空表示空动作：照常执行与记日志，不发送消息。</div></div>
+          <div class="setting-row compact"><div><label for="task-time-aware">时间感知</label><p>向 AI 提供触发时的日期与时间。</p></div><label class="switch-toggle"><input id="task-time-aware" type="checkbox" role="switch" checked><span class="slider"></span></label></div>
+          <div class="setting-row compact"><div><label for="task-holiday-aware">节假日感知</label><p>附加工作日与节假日信息。</p></div><label class="switch-toggle"><input id="task-holiday-aware" type="checkbox" role="switch"><span class="slider"></span></label></div>
+        </section>
+      </div>
+      <div class="editor-body" id="task-json-body" style="display:none"><section class="editor-panel"><div class="field"><label for="task-json">任务 JSON</label><textarea class="json-editor" id="task-json" spellcheck="false"></textarea><span class="field-hint">进阶编辑入口，适合直接查看与调整任务配置。</span></div></section></div>
+      <footer class="editor-footer"><span class="muted" id="next-fire-hint"></span><div class="button-group"><button class="btn btn-secondary" type="button" id="modal-cancel-btn">取消</button><button class="btn btn-primary" type="submit" id="modal-submit-btn">保存任务</button></div></footer>
+    </form>
+  </dialog>
+  <dialog id="confirm-modal-overlay" class="confirm-dialog" aria-labelledby="confirm-title"><header class="editor-header"><h2 id="confirm-title">确认操作</h2></header><div class="confirm-body"><p id="confirm-modal-text">确定？</p></div><footer class="editor-footer"><button class="btn btn-secondary" type="button" id="confirm-modal-cancel-btn">取消</button><button class="btn btn-danger" type="button" id="confirm-modal-ok-btn">确定</button></footer></dialog>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <div class="b64-popover" id="b64-popover"></div>
+  <script src="index.js"></script>
 </body>
 </html>

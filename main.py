@@ -28,7 +28,7 @@ SchedulerRuntime = _load_local("scheduler_runtime").SchedulerRuntime
 PLUGIN_NAME = "astrbot_plugin_enhanced_scheduler"
 
 
-@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，主动取或、被动取且的多触发器组合。", "1.4.3")
+@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，主动取或、被动取且的多触发器组合。", "1.5.0")
 class EnhancedSchedulerPlugin(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):
         super().__init__(context)
@@ -177,6 +177,8 @@ class EnhancedSchedulerPlugin(Star):
         name = str(req.get("name", "")).strip()
         if not name:
             return False, "任务名称不能为空", ""
+        if len(name) > 32:
+            return False, "任务名称不能超过 32 个字符", ""
 
         triggers = req.get("triggers", [])
         if not isinstance(triggers, list) or not triggers:
@@ -318,7 +320,7 @@ class EnhancedSchedulerPlugin(Star):
                 task = copy.deepcopy(self.store.tasks[src_id])
             now = time.time()
             new_id = str(uuid.uuid4())
-            task.update(id=new_id, name=task.get("name", "") + " (副本)", enabled=False,
+            task.update(id=new_id, name=str(task.get("name", ""))[:27] + " (副本)", enabled=False,
                         created_at=now, updated_at=now, last_success_time=0.0)
             for trigger in task.get("triggers", []):
                 if isinstance(trigger, dict) and trigger.get("type") in core.ACTIVE_TYPES:

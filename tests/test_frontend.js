@@ -10,6 +10,7 @@ function $(id) {
     if (!elements.has(id)) elements.set(id, {
         value: "", checked: false, style: {}, innerHTML: "", listeners: {},
         addEventListener(event, callback) { this.listeners[event] = callback; },
+        setAttribute() {},
     });
     return elements.get(id);
 }
@@ -21,6 +22,7 @@ const context = vm.createContext({
     TYPE_INFO: {interval: {}}, nextTriggerId: 2, selectedTriggerId: 1,
     renderTriggerCanvas() {}, renderTriggerPanel() {}, updateContentMode() {},
     updateValidateHints() {}, scheduleValidate() {},
+    normalizeDurationConfig: (type, config) => config, updateEditorName() {}, chooseEditorTab() {},
     activeTriggers: () => [{}],
 });
 
@@ -61,4 +63,35 @@ $("target-custom").value = "";
 assert.equal(context.validateForm(), false);
 $("task-text").value = "";
 assert.equal(context.validateForm(), true);
-console.log("Frontend checks passed: replacement, direct typing, JSON round-trip/rejection, empty-action validation.");
+$("task-name").value = "中".repeat(32);
+assert.equal(context.validateForm(), true);
+$("task-name").value = "中".repeat(33);
+assert.equal(context.validateForm(), false);
+
+// JSON cannot bypass the name limit or partially apply an invalid task.
+context.setJsonMode(true);
+$("task-json").value = JSON.stringify({name: "x".repeat(33), target: "other", triggers: []});
+$("task-json-toggle").listeners.click();
+assert.equal($("target-custom").value, "");
+assert.match(messages.at(-1), /32/);
+
+// Editing old oversized units must preserve the total duration exactly.
+const durationSource = source.slice(source.indexOf("    function normalizeDurationConfig("), source.indexOf("    function renderTriggerCanvas("));
+vm.runInContext(durationSource, context);
+const normalized = context.normalizeDurationConfig("interval", {days: 0, hours: 26, minutes: 74, base_time: "2026-10-10T00:00"});
+assert.equal(normalized.days, 1);
+assert.equal(normalized.hours, 3);
+assert.equal(normalized.minutes, 14);
+assert.equal(normalized.days * 1440 + normalized.hours * 60 + normalized.minutes, 26 * 60 + 74);
+const cooldown = context.normalizeDurationConfig("cooldown", {hours: 28, minutes: 74});
+assert.equal(cooldown.hours, 29);
+assert.equal(cooldown.minutes, 14);
+const numericSource = source.slice(source.indexOf("    function clampNumericInput("), source.indexOf("    function renderTriggerFields("));
+vm.runInContext(numericSource, context);
+const minuteInput = {value: "74", min: "0", max: "59", step: "1"};
+context.clampNumericInput(minuteInput);
+assert.equal(minuteInput.value, "59");
+minuteInput.value = "-3";
+context.clampNumericInput(minuteInput);
+assert.equal(minuteInput.value, "0");
+console.log("Frontend checks passed: targets, JSON, name limit, empty action, lossless duration conversion, numeric bounds.");

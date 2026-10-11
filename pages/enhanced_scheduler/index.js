@@ -6,6 +6,8 @@ async function init() {
     let allTasks = {};
     let sessionsList = [];
     let validateTimer = null;
+    let validateRevision = 0;
+    let savedConfig = null;
     const LOGS_PAGE_SIZE = 20;
     let logsPage = 0;
 
@@ -51,15 +53,14 @@ async function init() {
             document.querySelectorAll(".tab-view").forEach(v => v.classList.remove("active"));
             btn.classList.add("active");
             const tab = btn.getAttribute("data-tab");
+            document.querySelectorAll(".tab-btn").forEach(b => {
+                if (b === btn) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+            });
             $("view-" + tab).classList.add("active");
             if (tab === "logs") loadRunLogs(logsPage);
             if (tab === "llm" && !llmLoaded) loadLlmLogs(0);
         });
     });
-
-    const backBtn = $("back-btn");
-    if (window.self !== window.top) backBtn.style.display = "none";
-    else backBtn.addEventListener("click", () => showToast("请使用外部导航返回"));
 
     // ── 加载数据 ──
     async function loadData() {
@@ -81,46 +82,47 @@ async function init() {
     }
 
     function renderTasks() {
+        closeTaskMenu();
         const body = $("tasks-body");
         const keys = Object.keys(allTasks);
+        $("task-count").textContent = `${keys.filter(k => allTasks[k].enabled).length} 项启用 / 共 ${keys.length} 项`;
         if (!keys.length) {
-            body.innerHTML = `<tr><td colspan="8" class="table-empty">暂无计划任务，点击右上角新增。</td></tr>`;
+            body.innerHTML = `<tr><td colspan="6" class="table-empty">暂无计划任务，点击右上角新建。</td></tr>`;
             return;
         }
         body.innerHTML = keys.map(k => {
             const t = allTasks[k];
             const trgList = Array.isArray(t.triggers) ? t.triggers.filter(tr => tr && typeof tr === "object") : [];
-            const activeCount = trgList.filter(tr => tr.type === "interval" || tr.type === "cron").length;
-            const passiveCount = trgList.length - activeCount;
-            const trigSummary = `<span class="badge badge-llm">${activeCount} 主动</span> <span class="badge badge-fixed">${passiveCount} 被动</span>`;
+            const labels = {interval: "周期", cron: "cron", random: "随机", window: "区间", cooldown: "冷却"};
+            const trigSummary = [...new Set(trgList.map(tr => labels[tr.type] || tr.type))].map(escapeHtml).join("，");
             const ct = t.content || {};
             const mode = ct.mode || (ct.use_llm ? "conversation" : "fixed");
             const hasText = !!(ct.text && String(ct.text).trim());
-            const modeCN = {fixed:"固定文本", standalone:"独立AI", conversation:"对话AI"}[mode] || mode;
-            const contentBadge = hasText
-                ? `<span class="badge ${mode === 'fixed' ? 'badge-fixed' : 'badge-llm'}">${escapeHtml(modeCN)}</span>`
-                : '<span class="badge badge-noop">空动作</span>';
+            const modeCN = {fixed:"固定文本", standalone:"独立 AI", conversation:"对话 AI"}[mode] || mode;
             const nf = t._next_fire;
             const runtime = t._runtime || {};
-            const stateText = {waiting:"等待中", running:"执行中", faulted:"调度故障", disabled:"停用", needs_configuration:"需要重新配置"}[runtime.state] || (t.enabled ? "启用" : "停用");
-            const stateClass = ["faulted", "needs_configuration"].includes(runtime.state) ? "badge-failed" : (t.enabled ? "badge-active" : "badge-inactive");
+            const stateText = {waiting:"就绪", running:"执行中", faulted:"调度故障", disabled:"已停用", needs_configuration:"需要重新配置"}[runtime.state] || (t.enabled ? "就绪" : "已停用");
+            const stateClass = {faulted:"badge-failed", needs_configuration:"badge-warning", running:"badge-running"}[runtime.state] || (t.enabled ? "badge-active" : "badge-inactive");
             return `
                 <tr>
-                    <td class="cell-wrap"><strong>${escapeHtml(t.name)}</strong></td>
-                    <td class="cell-wrap"><span class="badge ${stateClass}">${escapeHtml(stateText)}</span>${runtime.error ? `<div class="form-hint">${escapeHtml(runtime.error)}</div>` : ''}</td>
+                    <td><button type="button" class="task-name edit-task-btn" data-id="${escapeHtml(k)}">${escapeHtml(t.name)}</button><div class="cell-secondary task-target" title="${escapeHtml(t.target || '')}">${escapeHtml(t.target || "未指定发送对象")}</div></td>
+                    <td class="cell-wrap"><span class="badge ${stateClass}">${escapeHtml(stateText)}</span>${runtime.error ? `<div class="form-hint row-error">${escapeHtml(runtime.error)}</div>` : ''}</td>
                     <td class="cell-wrap">${trigSummary || '—'}</td>
-                    <td>${nf ? fmtTs(nf) : '—'}</td>
-                    <td>${contentBadge}</td>
-                    <td class="cell-wrap">${escapeHtml(t.target || "—")}</td>
+                    <td class="next-check">${nf ? `<time class="tabular">${fmtTs(nf).slice(0, 16)}</time><div class="cell-secondary next-relative" data-next-fire="${Number(nf)}">${remainingTime(nf)}</div>` : '—'}</td>
+                    <td>${hasText ? escapeHtml(modeCN) : '空动作'}</td>
                     <td><div class="actions-cell">
-                        <button class="btn btn-edit edit-task-btn" data-id="${escapeHtml(k)}">编辑</button>
-                        <button class="btn btn-secondary btn-sm copy-task-btn" data-id="${escapeHtml(k)}">复制</button>
-                        <button class="btn btn-secondary btn-sm trigger-now-btn" data-id="${escapeHtml(k)}">触发一次</button>
-                        <button class="btn btn-danger delete-task-btn" data-id="${escapeHtml(k)}">删除</button>
+                        <button type="button" class="text-btn edit-task-btn" data-id="${escapeHtml(k)}">编辑</button>
+                        <button type="button" class="icon-btn more-task-btn" data-id="${escapeHtml(k)}" aria-label="${escapeHtml(t.name)}的更多操作" aria-expanded="false">⋯</button>
                     </div></td>
                 </tr>`;
         }).join("");
         attachTaskRowListeners();
+    }
+    function remainingTime(ts) {
+        const total = Math.max(0, Math.ceil((Number(ts) * 1000 - Date.now()) / 60000));
+        if (!total) return "即将检查";
+        const d = Math.floor(total / 1440), h = Math.floor(total % 1440 / 60), m = total % 60;
+        return `还剩 ${d ? d + "天" : ""}${h ? h + "时" : ""}${m}分`;
     }
 
     async function loadRunLogs(page) {
@@ -140,26 +142,26 @@ async function init() {
         if (logsPage > pages - 1) return loadRunLogs(pages - 1);
         const entries = res.entries || [];
         if (!entries.length) {
-            body.innerHTML = `<tr><td colspan="6" class="table-empty">暂无日志。任务触发后会在此显示最近记录。</td></tr>`;
+            body.innerHTML = `<tr><td colspan="5" class="table-empty">暂无日志。任务触发后会在此显示最近记录。</td></tr>`;
             $("logs-pager").innerHTML = "";
             return;
         }
         body.innerHTML = entries.map(l => {
             const tof = l.trigger_tof || {};
-            const tofStr = Object.keys(tof).map(id => `#${id}:${tof[id] ? '✓' : '✗'}`).join(" ");
-            const actionCN = {send_llm:"LLM发送",send_fixed:"发送文本",noop:"空动作",partial:"部分失败",skipped:"逻辑未过",failed:"失败"}[l.action] || l.action;
-            const actionBadge = l.action === "skipped" ? "badge-skipped" : (l.action === "failed" || l.action === "partial" ? "badge-failed" : "badge-active");
+            const tofStr = Object.keys(tof).map(id => `#${id} ${tof[id] ? '✓' : '✗'}`).join("，");
+            const triggerInfo = l.source === "manual" ? "手动触发，跳过触发器检查。" : `${tofStr ? tofStr + "；" : ""}${l.logic_result ? "条件全部通过。" : "条件未全部满足。"}`;
+            const actionCN = {send_llm:"AI 发送",send_fixed:"发送文本",noop:"空动作",partial:"部分失败",skipped:"跳过",failed:"失败"}[l.action] || l.action;
+            const actionBadge = ["skipped", "noop"].includes(l.action) ? "badge-skipped" : (l.action === "failed" || l.action === "partial" ? "badge-failed" : "badge-active");
             const detail = l.detail || "";
             // Old run logs remain readable; new records have a single target_result.
             const results = l.target_result ? [l.target_result] : (l.targets_result || []);
-            const targetInfo = results.map(tr => `${tr.umo}:${tr.ok ? '✓' : '✗' + (tr.error || '')}`).join(" ");
+            const targetInfo = results.map(tr => `发送对象：${tr.umo || "—"}，${tr.ok ? '成功' : '失败' + (tr.error ? '：' + tr.error : '')}。`).join(" ");
             return `<tr>
-                <td>${fmtTs(l.time)}</td>
+                <td><time class="log-time">${fmtTs(l.time)}</time></td>
                 <td class="cell-wrap">${escapeHtml(l.task_name)}</td>
-                <td class="cell-wrap">${escapeHtml(tofStr)}</td>
-                <td>${l.source === "manual" ? '<span class="badge badge-llm">手动</span>' : (l.logic_result ? '<span class="badge badge-active">通过</span>' : '<span class="badge badge-skipped">未过</span>')}</td>
+                <td class="cell-wrap">${escapeHtml(triggerInfo)}</td>
                 <td><span class="badge ${actionBadge}">${escapeHtml(actionCN)}</span></td>
-                <td class="cell-wrap">${escapeHtml(detail)} ${escapeHtml(targetInfo)}</td>
+                <td class="log-detail">${escapeHtml(detail)} ${escapeHtml(targetInfo)}</td>
             </tr>`;
         }).join("");
         renderLogsPager(pages, total);
@@ -169,7 +171,7 @@ async function init() {
         const pager = $("logs-pager");
         pager.innerHTML = `
             <button class="btn btn-secondary btn-sm" id="logs-page-prev" ${logsPage <= 0 ? "disabled" : ""}>上一页</button>
-            <span class="page-info">第 ${logsPage + 1} / ${pages} 页 · 共 ${total} 条</span>
+            <span class="page-info">第 ${logsPage + 1} / ${pages} 页 / 共 ${total} 条</span>
             <button class="btn btn-secondary btn-sm" id="logs-page-next" ${logsPage >= pages - 1 ? "disabled" : ""}>下一页</button>`;
         $("logs-page-prev").addEventListener("click", () => {
             if (logsPage > 0) loadRunLogs(logsPage - 1);
@@ -180,11 +182,27 @@ async function init() {
     }
 
     function renderConfig(cfg) {
-
+        if (savedConfig && configIsDirty()) return;
         $("config-log-retention").value = cfg.log_retention != null ? cfg.log_retention : 100;
         $("config-llm-timeout").value = cfg.llm_timeout != null ? cfg.llm_timeout : 60;
         $("config-llm-log-retention").value = cfg.llm_log_retention != null ? cfg.llm_log_retention : 10;
+        savedConfig = configValues();
+        updateConfigState();
     }
+    function configValues() {
+        return {log_retention: $("config-log-retention").value, llm_timeout: $("config-llm-timeout").value, llm_log_retention: $("config-llm-log-retention").value};
+    }
+    function configIsDirty() {
+        const values = configValues();
+        return savedConfig && Object.keys(values).some(key => String(values[key]) !== String(savedConfig[key]));
+    }
+    function updateConfigState() {
+        const dirty = !!configIsDirty();
+        $("save-config-btn").classList.toggle("btn-primary", dirty);
+        $("save-config-btn").classList.toggle("btn-secondary", !dirty);
+        $("config-dirty-hint").hidden = !dirty;
+    }
+    ["config-log-retention", "config-llm-timeout", "config-llm-log-retention"].forEach(id => $(id).addEventListener("input", updateConfigState));
 
     // ── LLM 调用日志（分页骨架 + 逐条加载；正文展开时才渲染，图片点击才取） ──
     let llmLoaded = false;
@@ -255,7 +273,7 @@ async function init() {
         const list = $("llm-log-list");
         list.innerHTML = entries.map(m => {
             const modeCN = m.mode === "conversation" ? "对话AI" : "独立AI";
-            const imgInfo = (m.images && m.images.length) ? ` · ${m.images.length}图 ${fmtSize(m.image_bytes)}` : "";
+            const imgInfo = (m.images && m.images.length) ? ` / ${m.images.length}图 ${fmtSize(m.image_bytes)}` : "";
             return `
                 <details class="llm-log-card">
                     <summary class="llm-log-summary">
@@ -332,7 +350,7 @@ async function init() {
         const page = Math.min(llmPage, pages - 1);
         pager.innerHTML = `
             <button class="btn btn-secondary btn-sm" id="llm-page-prev" ${page <= 0 ? "disabled" : ""}>上一页</button>
-            <span class="page-info">第 ${page + 1} / ${pages} 页 · 共 ${llmTotal} 条</span>
+            <span class="page-info">第 ${page + 1} / ${pages} 页 / 共 ${llmTotal} 条</span>
             <button class="btn btn-secondary btn-sm" id="llm-page-next" ${page >= pages - 1 ? "disabled" : ""}>下一页</button>`;
         const prev = $("llm-page-prev"), next = $("llm-page-next");
         if (prev) prev.addEventListener("click", () => { if (page > 0) loadLlmLogs(page - 1); });
@@ -355,7 +373,7 @@ async function init() {
             const ext = String(name).split(".").pop().toUpperCase();
             const idx = imgList.length;
             imgList.push({ name, size });
-            html += `<span class="b64-chip" data-idx="${idx}" title="点击加载图片">图片 ${escapeHtml(ext)} · ${fmtSize(size)}</span>`;
+            html += `<span class="b64-chip" data-idx="${idx}" title="点击加载图片">图片 ${escapeHtml(ext)} / ${fmtSize(size)}</span>`;
             last = IMG_MARK_RE.lastIndex;
         }
         html += escapeHtml(text.slice(last));
@@ -474,26 +492,60 @@ async function init() {
     $("clear-llm-btn").addEventListener("click", () => {
         confirmMode = "clear-llm";
         $("confirm-modal-text").textContent = "确定要清空所有 LLM 调用日志吗？此操作不可撤销。";
-        confirmModal.classList.add("active");
+        confirmModal.showModal();
     });
 
     function attachTaskRowListeners() {
         document.querySelectorAll(".edit-task-btn").forEach(b => b.addEventListener("click", () => openTaskModal("edit", b.getAttribute("data-id"))));
-        document.querySelectorAll(".copy-task-btn").forEach(b => b.addEventListener("click", () => copyTask(b.getAttribute("data-id"))));
-        document.querySelectorAll(".trigger-now-btn").forEach(b => b.addEventListener("click", () => triggerNow(b.getAttribute("data-id"), b)));
-        document.querySelectorAll(".delete-task-btn").forEach(b => b.addEventListener("click", () => confirmDelete(b.getAttribute("data-id"))));
+        document.querySelectorAll(".more-task-btn").forEach(b => b.addEventListener("click", () => openTaskMenu(b)));
     }
+    let menuAnchor = null;
+    function closeTaskMenu() {
+        $("task-menu").hidden = true;
+        if (menuAnchor) menuAnchor.setAttribute("aria-expanded", "false");
+        menuAnchor = null;
+    }
+    function openTaskMenu(button) {
+        const wasOpen = menuAnchor === button && !$("task-menu").hidden;
+        closeTaskMenu();
+        if (wasOpen) return;
+        menuAnchor = button;
+        button.setAttribute("aria-expanded", "true");
+        const id = escapeHtml(button.dataset.id);
+        const menu = $("task-menu");
+        menu.innerHTML = `<button type="button" data-action="copy" data-id="${id}">复制任务</button><button type="button" data-action="trigger" data-id="${id}">触发一次</button><div class="menu-divider"></div><button type="button" class="danger-text" data-action="delete" data-id="${id}">删除任务</button>`;
+        menu.hidden = false;
+        const rect = button.getBoundingClientRect();
+        menu.style.left = `${Math.max(12, Math.min(rect.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 12))}px`;
+        menu.style.top = `${Math.max(12, Math.min(rect.bottom + 5, window.innerHeight - menu.offsetHeight - 12))}px`;
+        menu.querySelector("button").focus();
+    }
+    $("task-menu").addEventListener("click", e => {
+        const button = e.target.closest("[data-action]");
+        if (!button) return;
+        const id = button.dataset.id;
+        closeTaskMenu();
+        if (button.dataset.action === "copy") copyTask(id);
+        if (button.dataset.action === "trigger") triggerNow(id, button);
+        if (button.dataset.action === "delete") confirmDelete(id);
+    });
+    document.addEventListener("click", e => { if (!e.target.closest("#task-menu, .more-task-btn")) closeTaskMenu(); });
+    document.addEventListener("keydown", e => {
+        if (e.key === "Escape" && menuAnchor) { const anchor = menuAnchor; closeTaskMenu(); anchor.focus(); e.preventDefault(); }
+    });
+    window.addEventListener("scroll", closeTaskMenu, true);
+    window.addEventListener("resize", closeTaskMenu);
 
     // ── 任务编辑弹窗 ──
     const modal = $("task-modal");
     const ACTIVE_TYPES = ["interval", "cron"];
     const PASSIVE_TYPES = ["window", "random", "cooldown"];
     const TYPE_INFO = {
-        interval: { kind: "active", label: "主动-周期型", desc: "从基准时间开始，每经过周期触发一次" },
-        cron: { kind: "active", label: "主动-cron型", desc: "按标准 5 段 cron 表达式（分 时 日 月 周）触发" },
-        window: { kind: "passive", label: "被动-区间型", desc: "被主动型触发器唤起后，若在指定时间段内则激活" },
-        random: { kind: "passive", label: "被动-随机型", desc: "被主动型触发器唤起后，以给定概率激活" },
-        cooldown: { kind: "passive", label: "被动-冷却型", desc: "被主动型触发器唤起后，若本任务上次成功后到现在时间超过冷却时长则触发" },
+        interval: { kind: "active", label: "周期触发", desc: "从基准时间起，按固定间隔检查任务。" },
+        cron: { kind: "active", label: "cron 触发", desc: "按日历时间检查任务。" },
+        window: { kind: "passive", label: "时间区间", desc: "仅在所选星期与时间区间内通过检查。" },
+        random: { kind: "passive", label: "随机条件", desc: "主动触发后，按设置的概率判断是否通过。" },
+        cooldown: { kind: "passive", label: "冷却条件", desc: "距本任务上次成功达到指定时长后，条件通过。" },
     };
     const WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 
@@ -503,25 +555,64 @@ async function init() {
     let lastValidate = { triggers: [], has_active: false, next_fire: null };
     let lastSuccessTime = 0;
 
-    function openModal() { modal.classList.add("active"); }
+    let editorTab = "basic";
+    function chooseEditorTab(name) {
+        editorTab = name;
+        document.querySelectorAll("[data-editor-tab]").forEach(button => {
+            const active = button.dataset.editorTab === name;
+            button.setAttribute("aria-selected", String(active));
+            button.tabIndex = active ? 0 : -1;
+        });
+        ["basic", "rules", "content"].forEach(tab => { $("editor-" + tab).hidden = tab !== name; });
+        $("task-form-body").scrollTop = 0;
+    }
+    document.querySelectorAll("[data-editor-tab]").forEach(button => button.addEventListener("click", () => chooseEditorTab(button.dataset.editorTab)));
+    $("editor-tabs").addEventListener("keydown", e => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+        const tabs = [...document.querySelectorAll("[data-editor-tab]")];
+        const index = tabs.indexOf(document.activeElement);
+        if (index < 0) return;
+        e.preventDefault();
+        const next = e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1 : (index + (e.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+        chooseEditorTab(tabs[next].dataset.editorTab);
+        tabs[next].focus();
+    });
+    function updateEditorName() {
+        const name = $("task-name").value;
+        $("editor-task-name").textContent = name;
+        $("editor-task-name").hidden = !name;
+        $("task-name-count").textContent = `${name.length} / 32`;
+    }
+    $("task-name").addEventListener("input", () => {
+        $("task-name").value = $("task-name").value.slice(0, 32);
+        updateEditorName();
+    });
+    function openModal() { modal.classList.add("active"); if (!modal.open) modal.showModal(); }
     function closeModal() {
+        clearTimeout(validateTimer);
+        ++validateRevision;
+        modal.close();
         modal.classList.remove("active");
         $("task-form").reset();
         triggers = []; selectedTriggerId = null;
-        $("trigger-canvas").innerHTML = "";
+        $("active-trigger-list").innerHTML = "";
+        $("passive-trigger-list").innerHTML = "";
         $("trigger-panel").innerHTML = "";
         setJsonMode(false);
     }
     $("modal-close-btn").addEventListener("click", closeModal);
     $("modal-cancel-btn").addEventListener("click", closeModal);
+    modal.addEventListener("cancel", e => { e.preventDefault(); closeModal(); });
     // 表单内容太多，点击遮罩层关闭容易误操作，暂时禁用
     // modal.addEventListener("click", e => { if (e.target === modal) closeModal(); });
 
     $("add-task-btn").addEventListener("click", () => openTaskModal("add", null));
 
     function openTaskModal(action, id) {
+        closeTaskMenu();
         const task = (action === "edit" && allTasks[id]) ? allTasks[id] : null;
         setJsonMode(false);
+        chooseEditorTab("basic");
         $("task-action").value = action;
         $("task-id").value = id || "";
         $("task-text").value = "";
@@ -531,7 +622,7 @@ async function init() {
         lastSuccessTime = task ? Number(task.last_success_time || 0) : 0;
 
         if (task) {
-            $("modal-title-text").textContent = "编辑: " + task.name;
+            $("modal-title-text").textContent = "编辑任务";
             $("task-name").value = task.name || "";
             $("task-enabled").checked = task.enabled !== false;
             const c = task.content || {};
@@ -543,11 +634,11 @@ async function init() {
             triggers = (Array.isArray(task.triggers) ? task.triggers : []).filter(tr => tr && TYPE_INFO[tr.type]).map(tr => ({
                 id: tr.id,
                 type: tr.type,
-                config: JSON.parse(JSON.stringify(tr.config || {})),
+                config: normalizeDurationConfig(tr.type, JSON.parse(JSON.stringify(tr.config || {}))),
             }));
             $("target-custom").value = task.target || "";
         } else {
-            $("modal-title-text").textContent = "新增计划任务";
+            $("modal-title-text").textContent = "新建任务";
             $("task-name").value = "";
             $("task-enabled").checked = true;
             $("task-mode").value = "fixed";
@@ -558,7 +649,12 @@ async function init() {
         }
         nextTriggerId = triggers.reduce((max, t) => Math.max(max, t.id), 0) + 1;
         selectedTriggerId = triggers.length ? triggers[0].id : null;
-
+        $("migration-notice").hidden = !task || !task.migration_notice;
+        $("migration-notice").textContent = task ? task.migration_notice || "" : "";
+        $("target-method-manual").checked = !!$("target-custom").value && !sessionsList.includes($("target-custom").value);
+        $("target-method-session").checked = !$("target-method-manual").checked;
+        updateEditorName();
+        updateTargetMethod();
         renderTargetPicker();
         renderTriggerCanvas();
         renderTriggerPanel();
@@ -568,7 +664,7 @@ async function init() {
         openModal();
     }
 
-    // ── 触发器：图形化框图 ──
+    // ── 触发器：按编号分组的槽位与参数面板 ──
     function activeTriggers() { return triggers.filter(t => ACTIVE_TYPES.includes(t.type)); }
     function passiveTriggers() { return triggers.filter(t => PASSIVE_TYPES.includes(t.type)); }
 
@@ -579,100 +675,25 @@ async function init() {
         if (type === "random") return { threshold: 0.5 };
         return { hours: 4, minutes: 0 };
     }
-
-    function triggerSummaryText(t) {
-        const c = t.config || {};
-        if (t.type === "interval") {
-            const d = parseInt(c.days) || 0, h = parseInt(c.hours) || 0, m = parseInt(c.minutes) || 0;
-            const parts = [];
-            if (d) parts.push(d + "天");
-            if (h) parts.push(h + "时");
-            if (m || !parts.length) parts.push(m + "分");
-            return "每 " + parts.join("");
-        }
-        if (t.type === "cron") return c.expr ? c.expr : "未填写表达式";
-        if (t.type === "window") {
-            const wd = Array.isArray(c.weekdays) ? c.weekdays : [];
-            const scope = wd.length ? "每周" + wd.map(i => WEEKDAY_CN[i] ? WEEKDAY_CN[i][1] : "").join("") : "每天";
-            return `${scope} ${c.start || "00:00"}-${c.end || "23:59"}`;
-        }
-        if (t.type === "random") return `概率 ${c.threshold != null ? c.threshold : 0.5}`;
-        if (t.type === "cooldown") return `冷却 ${parseInt(c.hours) || 0}时${parseInt(c.minutes) || 0}分`;
-        return "";
+    function normalizeDurationConfig(type, cfg) {
+        if (!["interval", "cooldown"].includes(type)) return cfg;
+        const d = type === "interval" ? Number(cfg.days || 0) : 0;
+        const h = Number(cfg.hours || 0), m = Number(cfg.minutes || 0);
+        if (![d, h, m].every(n => Number.isSafeInteger(n) && n >= 0)) return cfg;
+        const total = d * 1440 + h * 60 + m;
+        if (!Number.isSafeInteger(total)) return cfg;
+        return type === "interval" ? {...cfg, days: Math.floor(total / 1440), hours: Math.floor(total % 1440 / 60), minutes: total % 60} : {...cfg, hours: Math.floor(total / 60), minutes: total % 60};
     }
 
-    const NODE_W = 176, NODE_H = 62, GAP_X = 58, GAP_Y = 24, PAD = 24;
-
     function renderTriggerCanvas() {
-        const canvas = $("trigger-canvas");
-        const actives = activeTriggers();
-        const passives = passiveTriggers();
-        const startR = 20;
-        const startX = PAD + startR;
-        const activeX = PAD + startR * 2 + 26;
-        const chainX = activeX + NODE_W + GAP_X;
-        const targetW = 96, targetH = 46;
-        const rows = Math.max(actives.length, 1);
-        const colH = rows * NODE_H + (rows - 1) * GAP_Y;
-        const midY = PAD + colH / 2;
-        const passiveX = i => chainX + i * (NODE_W + GAP_X);
-        const targetX = passives.length
-            ? passiveX(passives.length - 1) + NODE_W + GAP_X
-            : activeX + NODE_W + GAP_X;
-        const width = targetX + targetW + PAD;
-        const height = PAD * 2 + colH;
-        const nodeTop = i => PAD + i * (NODE_H + GAP_Y);
-        const nodeCy = i => nodeTop(i) + NODE_H / 2;
-
-        const wires = [];
-        if (actives.length) {
-            actives.forEach((t, i) => {
-                wires.push(`<path class="wire" d="M ${startX + startR} ${midY} C ${startX + startR + 30} ${midY}, ${activeX - 30} ${nodeCy(i)}, ${activeX} ${nodeCy(i)}"/>`);
-                const fromX = activeX + NODE_W;
-                const toX = passives.length ? passiveX(0) : targetX;
-                wires.push(`<path class="wire" d="M ${fromX} ${nodeCy(i)} C ${fromX + 30} ${nodeCy(i)}, ${toX - 30} ${midY}, ${toX} ${midY}" marker-end="url(#trigger-arrow)"/>`);
-            });
-        } else {
-            wires.push(`<path class="wire dashed" d="M ${startX + startR} ${midY} L ${targetX} ${midY}" marker-end="url(#trigger-arrow)"/>`);
-        }
-        passives.forEach((t, i) => {
-            if (i > 0) wires.push(`<path class="wire" d="M ${passiveX(i - 1) + NODE_W} ${midY} L ${passiveX(i)} ${midY}"/>`);
-            if (i === passives.length - 1) wires.push(`<path class="wire" d="M ${passiveX(i) + NODE_W} ${midY} L ${targetX} ${midY}" marker-end="url(#trigger-arrow)"/>`);
-        });
-
-        const nodeHtml = (t, style) => `
-            <div class="tnode ${TYPE_INFO[t.type].kind === "active" ? "active" : "passive"}${t.id === selectedTriggerId ? " selected" : ""}" data-tid="${t.id}" style="${style}">
-                <span class="tnode-head">
-                    <span class="tnode-id">${t.id}</span>
-                    <span class="tnode-label">${TYPE_INFO[t.type].label}</span>
-                </span>
-                <span class="tnode-sub">${escapeHtml(triggerSummaryText(t))}</span>
-            </div>`;
-
-        canvas.style.width = width + "px";
-        canvas.style.height = height + "px";
-        canvas.innerHTML = `
-            <svg class="trigger-wires" width="${width}" height="${height}">
-                <defs>
-                    <marker id="trigger-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-                        <path d="M 0 0 L 8 4 L 0 8 z" fill="rgba(148,163,184,0.9)"></path>
-                    </marker>
-                </defs>
-                ${wires.join("")}
-            </svg>
-            <div class="tnode tstart" style="left:${PAD}px;top:${midY - startR}px;width:${startR * 2}px;height:${startR * 2}px;">Start</div>
-            ${actives.map((t, i) => nodeHtml(t, `left:${activeX}px;top:${nodeTop(i)}px;width:${NODE_W}px;height:${NODE_H}px;`)).join("")}
-            ${passives.map((t, i) => nodeHtml(t, `left:${passiveX(i)}px;top:${midY - NODE_H / 2}px;width:${NODE_W}px;height:${NODE_H}px;`)).join("")}
-            <div class="tnode ttarget" style="left:${targetX}px;top:${midY - targetH / 2}px;width:${targetW}px;height:${targetH}px;">Target</div>
-            ${actives.length ? "" : `<div class="canvas-hint" style="left:${activeX}px;top:${midY + 44}px;">还没有主动型触发器：任务不会自动触发</div>`}
-        `;
-        canvas.querySelectorAll(".tnode[data-tid]").forEach(el => {
-            el.addEventListener("click", () => {
-                selectedTriggerId = parseInt(el.dataset.tid);
-                renderTriggerCanvas();
-                renderTriggerPanel();
-            });
-        });
+        const render = items => items.map(t => `<button type="button" class="rule-row tnode${t.id === selectedTriggerId ? ' selected' : ''}" data-tid="${escapeHtml(t.id)}" aria-pressed="${t.id === selectedTriggerId}"><span class="rule-number">#${escapeHtml(t.id)}</span><span>${escapeHtml(TYPE_INFO[t.type].label)}</span></button>`).join("");
+        $("active-trigger-list").innerHTML = render(activeTriggers());
+        $("passive-trigger-list").innerHTML = render(passiveTriggers());
+        $("trigger-canvas").querySelectorAll("[data-tid]").forEach(button => button.addEventListener("click", () => {
+            selectedTriggerId = Number(button.dataset.tid);
+            renderTriggerCanvas();
+            renderTriggerPanel();
+        }));
         updateCanvasErrors();
     }
 
@@ -680,93 +701,53 @@ async function init() {
         const panel = $("trigger-panel");
         const t = triggers.find(x => x.id === selectedTriggerId);
         if (!t) {
-            panel.innerHTML = `<div class="empty-hint">点击上方节点查看并编辑该触发器的配置。</div>`;
+            panel.innerHTML = `<p class="field-hint">暂无触发器，请从左侧添加。</p>`;
             return;
         }
         const info = TYPE_INFO[t.type];
         const options = (info.kind === "active" ? ACTIVE_TYPES : PASSIVE_TYPES)
-            .map(k => `<option value="${k}" ${k === t.type ? "selected" : ""}>${TYPE_INFO[k].label}</option>`).join("");
-        panel.innerHTML = `
-            <div class="trigger-panel-header">
-                <span class="trigger-id-badge">${t.id}</span>
-                <select class="trigger-type-select" id="panel-type-select">${options}</select>
-                <span class="trigger-type-desc">${escapeHtml(info.desc)}</span>
-                <button class="btn btn-danger btn-sm" type="button" id="panel-delete-btn"><span>删除</span></button>
-            </div>
-            ${renderTriggerFields(t)}
-            <div class="trigger-next-fire" id="panel-next-fire"></div>
-        `;
+            .map(k => `<option value="${k}" ${k === t.type ? 'selected' : ''}>${TYPE_INFO[k].label}</option>`).join("");
+        panel.innerHTML = `<div class="rule-property"><div class="trigger-panel-header"><h3><span class="heading-id">#${escapeHtml(t.id)}</span> ${escapeHtml(info.label)}</h3></div><p class="field-hint trigger-type-desc">${escapeHtml(info.desc)}</p><div class="field"><label for="panel-type-select">触发器类型</label><select id="panel-type-select">${options}</select></div>${renderTriggerFields(t)}<div class="trigger-next-fire" id="panel-next-fire"></div></div><div class="rule-delete-row"><button class="btn btn-danger" type="button" id="panel-delete-btn">删除此触发器</button></div>`;
         $("panel-type-select").addEventListener("change", e => {
+            t._configs = t._configs || {};
+            t._configs[t.type] = JSON.parse(JSON.stringify(t.config));
             t.type = e.target.value;
-            t.config = defaultConfigFor(t.type);
+            t.config = t._configs[t.type] || defaultConfigFor(t.type);
+            lastValidate = {triggers: [], next_fire: null};
             renderTriggerCanvas();
             renderTriggerPanel();
+            updateValidateHints();
             scheduleValidate();
         });
         $("panel-delete-btn").addEventListener("click", () => removeTrigger(t.id));
         panel.querySelectorAll("[data-field]").forEach(el => {
-            el.addEventListener("input", () => syncPanelToTrigger(t));
-            el.addEventListener("change", () => syncPanelToTrigger(t));
+            const update = () => { if (el.type === "number") clampNumericInput(el); syncPanelToTrigger(t); };
+            el.addEventListener("input", update);
+            el.addEventListener("change", update);
+            if (el.type === "number") el.addEventListener("wheel", e => e.preventDefault(), {passive: false});
         });
-        panel.querySelectorAll(".weekday-chip input").forEach(cb => {
-            cb.addEventListener("change", () => {
-                cb.closest(".weekday-chip").classList.toggle("checked", cb.checked);
-                syncPanelToTrigger(t);
-            });
-        });
+        panel.querySelectorAll(".weekday-chip input").forEach(cb => cb.addEventListener("change", () => syncPanelToTrigger(t)));
         updatePanelNextFire();
     }
 
+    function clampNumericInput(el) {
+        if (el.value === "") return;
+        let value = Number(el.value);
+        if (!Number.isFinite(value)) return;
+        value = Math.max(Number(el.min || 0), Math.min(el.max === "" ? Number.MAX_SAFE_INTEGER : Number(el.max), value));
+        el.value = String(el.step === "1" ? Math.trunc(value) : value);
+    }
     function renderTriggerFields(t) {
         const c = t.config || {};
-        if (t.type === "interval") {
-            const baseVal = toDatetimeLocal(c.base_time) || defaultBaseTime();
-            return `
-                <div class="trigger-config-fields">
-                    <div class="full-row"><label class="form-hint">基准时间</label>
-                        <input type="datetime-local" class="form-input" data-field="base_time" value="${escapeHtml(baseVal)}"></div>
-                    <div class="full-row interval-row">
-                        <span class="interval-duration-label">周期时长</span>
-                        <input type="number" class="form-input" data-field="days" min="0" value="${parseInt(c.days) || 0}"><span class="unit">天</span>
-                        <input type="number" class="form-input" data-field="hours" min="0" value="${parseInt(c.hours) || 0}"><span class="unit">小时</span>
-                        <input type="number" class="form-input" data-field="minutes" min="0" value="${parseInt(c.minutes) || 0}"><span class="unit">分钟</span>
-                    </div>
-                </div>`;
-        }
-        if (t.type === "cron") {
-            return `
-                <div class="trigger-config-fields">
-                    <div class="full-row"><label class="form-hint">cron 表达式（5段：分 时 日 月 周）</label>
-                        <input type="text" class="form-input" data-field="expr" placeholder="0 */4 * * *" value="${escapeHtml(c.expr || "")}"></div>
-                </div>`;
-        }
+        const number = (key, label, max = Number.MAX_SAFE_INTEGER) => `<label><input type="number" data-field="${key}" min="0" max="${max}" step="1" aria-label="${label}" value="${escapeHtml(c[key] || 0)}"><span>${label}</span></label>`;
+        if (t.type === "interval") return `<div class="trigger-config-fields"><div class="field full-row"><label for="trigger-base">基准时间</label><input type="datetime-local" id="trigger-base" data-field="base_time" value="${escapeHtml(toDatetimeLocal(c.base_time) || defaultBaseTime())}"></div><div class="field full-row"><span class="field-label">间隔时长</span><div class="duration-fields">${number('days', '天')}${number('hours', '小时', 23)}${number('minutes', '分钟', 59)}</div></div></div>`;
+        if (t.type === "cron") return `<div class="field"><label for="trigger-expr">cron 表达式</label><input id="trigger-expr" class="mono" data-field="expr" placeholder="0 */4 * * *" value="${escapeHtml(c.expr || '')}"><p class="field-hint">五段依次为：分、时、日、月、周。</p></div>`;
         if (t.type === "window") {
             const wd = Array.isArray(c.weekdays) ? c.weekdays : [];
-            return `
-                <div class="trigger-config-fields">
-                    <div><label class="form-hint">起始 HH:MM</label><input type="time" class="form-input" data-field="start" value="${escapeHtml(c.start || "08:00")}"></div>
-                    <div><label class="form-hint">结束 HH:MM</label><input type="time" class="form-input" data-field="end" value="${escapeHtml(c.end || "20:00")}"></div>
-                    <div class="full-row"><label class="form-hint">星期</label>
-                        <div class="weekdays-group">
-                            ${WEEKDAY_CN.map((d, i) => `<label class="weekday-chip ${wd.includes(i) ? "checked" : ""}"><input type="checkbox" data-weekday="${i}" ${wd.includes(i) ? "checked" : ""}>${d}</label>`).join("")}
-                        </div>
-                    </div>
-                </div>`;
+            return `<div class="trigger-config-fields"><div class="field"><label for="trigger-start">开始时间</label><input id="trigger-start" type="time" data-field="start" value="${escapeHtml(c.start || '08:00')}"></div><div class="field"><label for="trigger-end">结束时间</label><input id="trigger-end" type="time" data-field="end" value="${escapeHtml(c.end || '20:00')}"></div><div class="field full-row"><span class="field-label">星期</span><div class="weekdays-group">${WEEKDAY_CN.map((day, i) => `<label class="weekday-chip"><input type="checkbox" data-weekday="${i}" ${wd.includes(i) ? 'checked' : ''}>${day}</label>`).join('')}</div><p class="field-hint">支持跨天区间，例如 22:00 至次日 06:00。</p></div></div>`;
         }
-        if (t.type === "random") {
-            return `
-                <div class="trigger-config-fields">
-                    <div><label class="form-hint">概率值 (0-1)</label>
-                        <input type="number" class="form-input" data-field="threshold" min="0" max="1" step="0.01" value="${c.threshold != null ? c.threshold : 0.5}"></div>
-                </div>`;
-        }
-        return `
-            <div class="trigger-config-fields">
-                <div class="full-row interval-row">
-                    <input type="number" class="form-input" data-field="hours" min="0" value="${parseInt(c.hours) || 0}"><span class="unit">小时</span>
-                    <input type="number" class="form-input" data-field="minutes" min="0" value="${parseInt(c.minutes) || 0}"><span class="unit">分钟</span>
-                </div>
-            </div>`;
+        if (t.type === "random") return `<div class="field narrow-field"><label for="trigger-probability">通过概率</label><input id="trigger-probability" type="number" data-field="threshold" min="0" max="1" step="0.01" value="${escapeHtml(c.threshold != null ? c.threshold : 0.5)}"><p class="field-hint">范围 0–1，0.15 表示 15%。</p></div>`;
+        return `<div class="field"><span class="field-label">冷却时长</span><div class="duration-fields two">${number('hours', '小时')}${number('minutes', '分钟', 59)}</div></div>`;
     }
 
     function syncPanelToTrigger(t) {
@@ -818,12 +799,21 @@ async function init() {
 
     // ── 单个发送目标 ──
     function renderTargetPicker() {
-        $("target-select").innerHTML = `<option value="">选择活跃会话…</option>` +
-            sessionsList.map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join("");
-        $("target-select").value = sessionsList.includes($("target-custom").value) ? $("target-custom").value : "";
+        const target = $("target-custom").value;
+        const sessions = target && !sessionsList.includes(target) ? [target, ...sessionsList] : sessionsList;
+        $("target-select").innerHTML = `<option value="">不指定发送对象</option>` +
+            sessions.map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join("");
+        $("target-select").value = target;
     }
+    function updateTargetMethod() {
+        const manual = $("target-method-manual").checked;
+        $("target-select").hidden = manual;
+        $("target-custom").hidden = !manual;
+    }
+    $("target-method-session").addEventListener("change", () => { renderTargetPicker(); updateTargetMethod(); });
+    $("target-method-manual").addEventListener("change", updateTargetMethod);
     $("target-select").addEventListener("change", () => {
-        if ($("target-select").value) $("target-custom").value = $("target-select").value;
+        $("target-custom").value = $("target-select").value;
     });
     $("target-custom").addEventListener("input", () => {
         $("target-select").value = sessionsList.includes($("target-custom").value) ? $("target-custom").value : "";
@@ -839,11 +829,11 @@ async function init() {
             label: "发送内容",
         },
         standalone: {
-            detail: "使用上方「独立 AI 系统提示」+ 下方任务提示词单独调用 AI 生成回复，不携带对话人格、不与其他插件互动。",
+            detail: "使用本任务的系统提示调用 AI，不注入会话人格与上下文。",
             label: "任务提示词",
         },
         conversation: {
-            detail: "把下方任务提示词交给目标对话配置的 AI 生成回复，携带该对话的人格 system prompt 与记忆插件注入。",
+            detail: "使用目标会话的人格与上下文生成回复。",
             label: "任务提示词",
         },
     };
@@ -868,6 +858,7 @@ async function init() {
     // ── 触发器实时校验 + 下次检查触发时间 ──
     function scheduleValidate() {
         clearTimeout(validateTimer);
+        ++validateRevision;
         validateTimer = setTimeout(doValidate, 400);
     }
     function updateValidateHints() {
@@ -878,9 +869,9 @@ async function init() {
             return;
         }
         el.textContent = lastValidate.next_fire
-            ? "下次检查触发时间: " + fmtTs(lastValidate.next_fire)
-            : "下次检查触发时间：待计算…";
-        el.style.color = "var(--color-primary)";
+            ? "下次检查：" + fmtTs(lastValidate.next_fire)
+            : "下次检查：待计算…";
+        el.style.color = "var(--text-secondary)";
     }
     function updatePanelNextFire() {
         const el = $("panel-next-fire");
@@ -905,7 +896,7 @@ async function init() {
             return;
         }
         const fires = (r && r.future_fires) || [];
-        el.textContent = fires.length ? "未来触发: " + fires.map(f => fmtTs(f)).join("，") : "未来触发：请完成配置……";
+        el.innerHTML = fires.length ? `<h4>未来三次检查</h4>${fires.map(f => `<time>${fmtTs(f)}</time>`).join("")}` : "未来检查：请完成配置…";
         el.className = fires.length ? "trigger-next-fire active" : "trigger-next-fire";
     }
     function updateCanvasErrors() {
@@ -916,9 +907,11 @@ async function init() {
     }
     async function doValidate() {
         if (!modal.classList.contains("active")) return;
+        const revision = validateRevision;
         const payload = triggers.map(t => ({ id: t.id, type: t.type, config: t.config }));
         try {
             const res = await bridge.apiPost("validate", { triggers: payload });
+            if (revision !== validateRevision || !modal.open) return;
             if (!res || res.status !== "success") return;
             lastValidate = res.results || { triggers: [], next_fire: null };
             updateValidateHints();
@@ -926,26 +919,6 @@ async function init() {
             updateCanvasErrors();
         } catch (e) { /* 静默 */ }
     }
-
-    // ── 画布平移（按住空白处拖动） ──
-    const canvasViewport = $("trigger-canvas-viewport");
-    let panState = null;
-    canvasViewport.addEventListener("mousedown", e => {
-        if (e.target.closest(".tnode")) return;
-        panState = { x: e.clientX, y: e.clientY, sl: canvasViewport.scrollLeft, st: canvasViewport.scrollTop };
-        canvasViewport.classList.add("panning");
-        e.preventDefault();
-    });
-    window.addEventListener("mousemove", e => {
-        if (!panState) return;
-        canvasViewport.scrollLeft = panState.sl - (e.clientX - panState.x);
-        canvasViewport.scrollTop = panState.st - (e.clientY - panState.y);
-    });
-    window.addEventListener("mouseup", () => {
-        if (!panState) return;
-        panState = null;
-        canvasViewport.classList.remove("panning");
-    });
 
     // ── 表单 ↔ JSON（进阶纯文本配置） ──
     function buildTaskPayload() {
@@ -981,10 +954,11 @@ async function init() {
         triggers = raw.filter(t => t && TYPE_INFO[t.type]).map((t, i) => ({
             id: Number.isInteger(t.id) && t.id > 0 ? t.id : i + 1,
             type: t.type,
-            config: (t.config && typeof t.config === "object" && !Array.isArray(t.config)) ? t.config : {},
+            config: normalizeDurationConfig(t.type, (t.config && typeof t.config === "object" && !Array.isArray(t.config)) ? t.config : {}),
         }));
         $("target-custom").value = obj.target || "";
         renderTargetPicker();
+        updateEditorName();
         nextTriggerId = triggers.reduce((max, t) => Math.max(max, t.id), 0) + 1;
         selectedTriggerId = triggers.length ? triggers[0].id : null;
 
@@ -1001,6 +975,8 @@ async function init() {
         jsonMode = on;
         $("task-form-body").style.display = on ? "none" : "";
         $("task-json-body").style.display = on ? "" : "none";
+        $("editor-tabs").style.display = on ? "none" : "";
+        $("task-json-toggle").setAttribute("aria-pressed", String(on));
         $("task-json-toggle").innerHTML = `<span>${on ? "表单模式" : "JSON 模式"}</span>`;
         if (on) $("task-json").value = JSON.stringify(buildTaskPayload(), null, 2);
     }
@@ -1018,12 +994,14 @@ async function init() {
             showToast("请使用单个 target 对话字符串，不再支持 targets 数组", true);
             return;
         }
+        if (String(obj.name || "").trim().length > 32) { showToast("任务名称不能超过 32 个字符", true); return; }
         applyTaskPayload(obj);
         setJsonMode(false);
     });
 
     function validateForm() {
-        if (!$("task-name").value.trim()) { showToast("请填写任务名称", true); return false; }
+        if (!$("task-name").value.trim()) { showToast("请填写任务名称", true); chooseEditorTab("basic"); $("task-name").focus(); return false; }
+        if ($("task-name").value.trim().length > 32) { showToast("任务名称不能超过 32 个字符", true); chooseEditorTab("basic"); return false; }
         if (!triggers.length) { showToast("至少需要一个触发器", true); return false; }
         if (!activeTriggers().length) { showToast("至少需要一个主动型触发器（周期型或 cron 型）", true); return false; }
         if (!$("target-custom").value.trim() && $("task-text").value.trim()) { showToast("请选择一个发送目标对话", true); return false; }
@@ -1045,6 +1023,7 @@ async function init() {
                 showToast("JSON 顶层必须是对象", true);
                 return;
             }
+            if (String(payload.name || "").trim().length > 32) { showToast("任务名称不能超过 32 个字符", true); return; }
             // id 以当前编辑的任务为准（新增时不带 id）
             const editingId = $("task-id").value;
             if (editingId) payload.id = editingId;
@@ -1067,7 +1046,7 @@ async function init() {
         } catch (err) {
             showToast("请求失败: " + err.message, true);
         } finally {
-            btn.disabled = false; btn.textContent = "保存";
+            btn.disabled = false; btn.textContent = "保存任务";
         }
     });
 
@@ -1112,9 +1091,10 @@ async function init() {
         pendingDeleteId = id;
         const t = allTasks[id];
         $("confirm-modal-text").textContent = `确定要删除任务「${t ? t.name : id}」吗？`;
-        confirmModal.classList.add("active");
+        confirmModal.showModal();
     }
-    function closeConfirm() { confirmModal.classList.remove("active"); pendingDeleteId = null; confirmMode = "delete"; }
+    function closeConfirm() { confirmModal.close(); pendingDeleteId = null; confirmMode = "delete"; }
+    confirmModal.addEventListener("cancel", e => { e.preventDefault(); closeConfirm(); });
     $("confirm-modal-cancel-btn").addEventListener("click", closeConfirm);
     confirmModal.addEventListener("click", e => { if (e.target === confirmModal) closeConfirm(); });
     $("confirm-modal-ok-btn").addEventListener("click", async () => {
@@ -1147,27 +1127,32 @@ async function init() {
         const payload = {
             log_retention: parseInt($("config-log-retention").value) || 100,
             llm_timeout: parseInt($("config-llm-timeout").value) || 60,
-            llm_log_retention: parseInt($("config-llm-log-retention").value) || 500,
+            llm_log_retention: parseInt($("config-llm-log-retention").value) || 10,
         };
         const btn = $("save-config-btn");
         btn.disabled = true; btn.textContent = "保存中...";
         try {
             const res = await bridge.apiPost("save_config", payload);
-            if (res && res.status === "success") showToast("配置已保存");
+            if (res && res.status === "success") { savedConfig = payload; updateConfigState(); showToast("配置已保存"); }
             else showToast("保存失败: " + (res && res.message || ""), true);
         } catch (e) { showToast("保存失败: " + e.message, true); }
         finally { btn.disabled = false; btn.textContent = "保存配置"; }
     });
 
     $("refresh-logs-btn").addEventListener("click", () => loadRunLogs(logsPage));
+    $("refresh-tasks-btn").addEventListener("click", loadData);
 
     // ── 初始化 ──
     await loadSessions();
     await loadData();
     setInterval(() => {
         if (document.hidden) return;
+        document.querySelectorAll("[data-next-fire]").forEach(el => { el.textContent = remainingTime(el.dataset.nextFire); });
+    }, 60000);
+    setInterval(() => {
+        if (document.hidden) return;
         if ($("view-logs").classList.contains("active")) loadRunLogs(logsPage);
-        if ($("view-tasks").classList.contains("active") && !modal.classList.contains("active")) loadData();
+        if ($("view-tasks").classList.contains("active") && !modal.classList.contains("active") && $("task-menu").hidden) loadData();
     }, 8000);
 }
 

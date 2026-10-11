@@ -684,6 +684,24 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不再支持", response["message"])
         self.assertEqual(self.plugin.store.tasks, {})
 
+    async def test_task_name_limit_on_create_update_and_copy(self):
+        self.request.body = dict(task(), name="中" * 33)
+        response, status = await self.plugin._api_upsert_task()
+        self.assertEqual(status, 400)
+        self.assertIn("32", response["message"])
+        self.assertEqual(self.plugin.store.tasks, {})
+        self.request.body = dict(task(), name="中" * 32)
+        self.assertEqual((await self.plugin._api_upsert_task())["status"], "success")
+        self.request.body = dict(task(), name="改" * 33)
+        response, status = await self.plugin._api_upsert_task()
+        self.assertEqual(status, 400)
+        self.assertEqual(self.plugin.store.tasks["a"]["name"], "中" * 32)
+        self.request.body = {"id": "a"}
+        copied = await self.plugin._api_copy_task()
+        name = self.plugin.store.tasks[copied["id"]]["name"]
+        self.assertEqual(len(name), 32)
+        self.assertTrue(name.endswith(" (副本)"))
+
     async def test_saving_migrated_task_clears_notice(self):
         old = task()
         old.update(enabled=False, migration_notice="需要重新配置")
