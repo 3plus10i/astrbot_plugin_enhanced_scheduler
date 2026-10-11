@@ -1,6 +1,6 @@
 __pycache__/
 note*
 .codebuddy
-*.drawio*
-*.png
 .dev/
+docs/
+.vscode/
