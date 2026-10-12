@@ -30,9 +30,22 @@ const context = vm.createContext({
 const picker = source.slice(source.indexOf("    // ── 单个发送目标"), source.indexOf("    // ── 任务内容模式说明"));
 const form = source.slice(source.indexOf("    function buildTaskPayload()"), source.indexOf("    // ── 提交任务"));
 vm.runInContext(picker + form, context);
+vm.runInContext(source.slice(source.indexOf("    function expiryInputValue("), source.indexOf("    // ── Tab 切换")), context);
 $("task-name").value = "test";
 $("task-text").value = "hello";
 $("task-mode").value = "fixed";
+$("task-record-history").checked = true;
+
+// Expiry/history settings survive the real form -> JSON -> form round-trip.
+$("task-expires-at").value = "2026-12-31T23:59:12";
+const expiryPayload = context.buildTaskPayload();
+assert.equal(expiryPayload.expires_at, new Date("2026-12-31T23:59:12").getTime() / 1000);
+assert.equal(expiryPayload.content.record_history, true);
+context.applyTaskPayload({...expiryPayload, content: {...expiryPayload.content, record_history: false}});
+assert.equal($("task-expires-at").value, "2026-12-31T23:59:12");
+assert.equal(context.buildTaskPayload().content.record_history, false);
+$("task-expires-at").value = "";
+assert.equal(context.buildTaskPayload().expires_at, null);
 
 // A second selection replaces the first; typed text is saved without pressing Enter.
 $("target-select").value = "test:FriendMessage:one";
@@ -145,7 +158,25 @@ assert.equal(triggerContext.formatTriggerResults({task_id: "changed", trigger_to
     trigger_labels: {100: "A1", 200: "B1", 300: "B2"}}), "A1 ✓，B1 ✗，B2 ✓");
 assert.equal(triggerContext.probabilityText(0.25), "以25%概率执行");
 assert.equal(triggerContext.probabilityText(1), "以100%概率执行");
+assert.equal(triggerContext.probabilityText(1, true), "语境待判定");
+assert.equal(triggerContext.probabilityText(0.25, true), "随机通过概率 25%，语境待判定");
 assert.notEqual(triggerContext.probabilityText(0.00000001), "以0%概率执行");
+
+// JSON modal preserves the event snapshot and treats HTML inside it as text.
+const logElements = {
+    "run-log-json": {textContent: "", scrollTop: 9},
+    "run-log-modal": {open: false, showModal() { this.open = true; }, close() { this.open = false; }},
+    "run-log-close": {addEventListener() {}},
+};
+const logContext = vm.createContext({$: id => logElements[id]});
+vm.runInContext(source.slice(source.indexOf("    function openRunLogJson("), source.indexOf("    function renderLogsPager(")), logContext);
+const rawLog = {task_name: "<script>bad()</script>", trigger_tof: {1: true}, trigger_details: {1: {sample: 0.12}}};
+logContext.openRunLogJson(rawLog);
+assert.equal(logElements["run-log-json"].textContent, JSON.stringify(rawLog, null, 2));
+assert.equal(logElements["run-log-json"].scrollTop, 0);
+assert.equal(logElements["run-log-modal"].open, true);
+rawLog.task_name = "changed";
+assert.match(logElements["run-log-json"].textContent, /<script>bad/);
 
 // Footer distinguishes pending, impossible, invalid, and probabilistic task times.
 const hintContext = vm.createContext({

@@ -3,6 +3,7 @@ import asyncio
 import copy
 import math
 import time
+import uuid
 
 
 class SchedulerRuntime:
@@ -29,7 +30,7 @@ class SchedulerRuntime:
         if not isinstance(task, dict):
             return {"state": "faulted", "error": "任务格式错误"}
         if not task.get("enabled", True):
-            return {"state": "disabled"}
+            return {"state": "disabled", **({"reason": task["disabled_reason"]} if task.get("disabled_reason") else {})}
         return dict(self._states.get(task_id, {"state": "waiting"}))
 
     async def start(self):
@@ -90,6 +91,9 @@ class SchedulerRuntime:
             raise ValueError("任务至少需要一个主动触发器")
         if not math.isfinite(float(task.get("last_success_time", 0) or 0)):
             raise ValueError("成功时间必须是有限数值")
+        ok, message = self.core.validate_task_options(task)
+        if not ok:
+            raise ValueError(message)
         if "targets" in task or not isinstance(task.get("target", ""), str):
             raise ValueError("任务必须使用单个 target 对话")
         content = task.get("content")
@@ -97,8 +101,20 @@ class SchedulerRuntime:
             raise ValueError("任务内容格式错误")
         if content.get("mode", "fixed") not in ("fixed", "standalone", "conversation"):
             raise ValueError("任务执行模式错误")
-        if str(content.get("text", "") or "").strip() and not task.get("target", "").strip():
+        if (str(content.get("text", "") or "").strip() or any(t["type"] == self.core.T_CONTEXTUAL for t in triggers)) and not task.get("target", "").strip():
             raise ValueError("请选择一个发送目标对话")
+
+    async def _expire(self, task_id, task, now):
+        ok, message = self.core.validate_task_options(task)
+        if not ok:
+            raise ValueError(message)
+        if not self.core.task_expired(task, now):
+            return False
+        if task.get("enabled", True):
+            task.update(enabled=False, disabled_reason="有效期已结束", updated_at=now)
+            self._log(task_id, task, now, "expired", None, "有效期已结束，任务自动停用", {}, None, "scheduled")
+            await self.store.save()
+        return True
 
     def _deadline(self, task, now):
         """Returns (下一个未来触发点, 等待时长)。
@@ -110,6 +126,9 @@ class SchedulerRuntime:
         deadline = self.core.next_trigger_preview(
             task["triggers"], now, float(task.get("last_success_time", 0) or 0)
         )
+        expiry = task.get("expires_at")
+        if expiry is not None and (deadline is None or expiry <= deadline):
+            return expiry, max(0.05, expiry - now)
         if deadline is None or not math.isfinite(deadline):
             raise ValueError("无法计算下一次触发时间，请检查触发器配置")
         return deadline, max(0.05, deadline - now + 0.05)
@@ -131,11 +150,21 @@ class SchedulerRuntime:
                 task = self.store.tasks.get(task_id)
                 if task is None or not task.get("enabled", True):
                     return
-                if self._states.get(task_id, {}).get("state") == "faulted":
-                    await self._wait(event)
-                    continue
                 try:
                     started_wait = time.time()
+                    if self._states.get(task_id, {}).get("state") == "faulted":
+                        # Invalid expiry must remain parked instead of faulting on every loop.
+                        options_valid, _ = self.core.validate_task_options(task)
+                        expiry = task.get("expires_at") if options_valid else None
+                        if expiry and started_wait >= expiry:
+                            async with self.lock(task_id):
+                                if await self._expire(task_id, task, started_wait):
+                                    return
+                        await self._wait(event, max(0.05, expiry - started_wait) if expiry else None)
+                        continue
+                    async with self.lock(task_id):
+                        if await self._expire(task_id, task, started_wait):
+                            return
                     deadline, delay = self._deadline(task, started_wait)
                     if self._states.get(task_id, {}).get("state") != "running":
                         self._states[task_id] = {
@@ -149,6 +178,8 @@ class SchedulerRuntime:
                         task = self.store.tasks.get(task_id)
                         if task is None or not task.get("enabled", True):
                             continue
+                        if await self._expire(task_id, task, time.time()):
+                            return
                         if self._states.get(task_id, {}).get("state") == "faulted":
                             continue
                         try:
@@ -185,15 +216,37 @@ class SchedulerRuntime:
             return
         task["updated_at"] = now
         tof = result["trigger_tof"]
+        details = result["trigger_details"]
+        run_id = uuid.uuid4().hex
+        # Persist before any external AI request or send; each occurrence is consumed once.
+        await self.store.save()
+        if result["should_run"]:
+            previous = self._states.get(task_id)
+            self._states[task_id] = {"state": "running"}
+            try:
+                for trigger in self.core.ordered_passives(task["triggers"]):
+                    if trigger["type"] != self.core.T_CONTEXTUAL:
+                        continue
+                    if self.core.task_expired(task, time.time()):
+                        await self._expire(task_id, task, time.time())
+                        return
+                    assessment = await self.executor.check_context(task, trigger, time.time(), run_id)
+                    details[trigger["id"]] = assessment
+                    tof[trigger["id"]] = assessment["result"]
+                    if not assessment["result"]:
+                        result["should_run"] = False
+                        break
+            finally:
+                self._states[task_id] = previous or {"state": "waiting"}
         if not result["should_run"]:
             self._log(task_id, task, now, "skipped", None,
-                      "跳过（被动触发器条件未全部满足）", tof, False, "scheduled")
+                      "跳过（被动触发器条件未全部满足）", tof, False, "scheduled", details, run_id)
             await self.store.save()
+            await self._expire(task_id, task, time.time())
             return
         # Durably consume the time opportunity before external side effects.
         # Sending has no idempotency key: never automatically replay an uncertain send.
-        await self.store.save()
-        await self._execute(task_id, task, now, tof, "scheduled")
+        await self._execute(task_id, task, now, tof, "scheduled", details, run_id)
 
     async def trigger_now(self, task_id):
         if self._closed or not self._started:
@@ -213,32 +266,41 @@ class SchedulerRuntime:
         async with self.lock(task_id):
             task = self.store.tasks[task_id]
             self._validate(task)
+            if await self._expire(task_id, task, time.time()):
+                raise ValueError("有效期已结束，请修改有效期后再触发")
             try:
                 return await self._execute(task_id, task, time.time(), {}, "manual")
             except Exception as exc:
                 await self._fault(task_id, exc, source="manual")
                 raise
 
-    async def _execute(self, task_id, task, now, tof, source):
+    async def _execute(self, task_id, task, now, tof, source, trigger_details=None, run_id=None):
         previous = self._states.get(task_id)
         self._states[task_id] = {"state": "running"}
         try:
+            run_id = run_id or uuid.uuid4().hex
+            definition = copy.deepcopy(task)
+            definition["_run_id"] = run_id
             action, target_result, detail, success = await self.executor.execute(
-                copy.deepcopy(task), now, source
+                definition, now, source
             )
             if success:
-                task["last_success_time"] = time.time()
+                task["last_success_time"] = (target_result or {}).get("sent_at", time.time())
             self._log(task_id, task, now, action, target_result, detail, tof,
-                      True if source == "scheduled" else None, source)
+                      True if source == "scheduled" else None, source, trigger_details, run_id)
             await self.store.save()
+            await self._expire(task_id, task, time.time())
             return action, detail
         finally:
             self._states[task_id] = previous or {"state": "waiting"}
 
-    def _log(self, task_id, task, now, action, target_result, detail, tof, logic, source):
+    def _log(self, task_id, task, now, action, target_result, detail, tof, logic, source, trigger_details=None, run_id=None):
         self.store.append_log({
             "time": now, "task_id": task_id, "task_name": task.get("name", ""),
             "trigger_tof": tof, "logic_result": logic, "action": action,
             "trigger_labels": self.core.trigger_labels(task.get("triggers", [])),
             "target_result": target_result, "detail": detail, "source": source,
+            "run_id": run_id or uuid.uuid4().hex,
+            "trigger_details": copy.deepcopy(trigger_details or {}),
+            "task_snapshot": copy.deepcopy(task),
         })

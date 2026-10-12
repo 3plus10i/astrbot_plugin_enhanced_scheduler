@@ -401,6 +401,8 @@ def _build_llm_meta(entry: dict, name: str, images: List[dict], text_bytes: int)
         "task_name": entry.get("task_name", ""),
         "source": entry.get("source", "scheduled"),
         "mode": entry.get("mode", ""),
+        "run_id": entry.get("run_id"),
+        "trigger_id": entry.get("trigger_id"),
         "umo": entry.get("umo", ""),
         "ok": bool(entry.get("ok")),
         "duration_ms": entry.get("duration_ms", 0),

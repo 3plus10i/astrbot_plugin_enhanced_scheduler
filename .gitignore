@@ -2,5 +2,5 @@ __pycache__/
 note*
 .codebuddy
 .dev/
-docs/
+# docs/
 .vscode/

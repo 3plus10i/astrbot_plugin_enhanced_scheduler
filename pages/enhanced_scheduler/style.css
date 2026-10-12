@@ -297,6 +297,11 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--color-primary)
 @keyframes next-fire-refresh { from { background-color: var(--bg-preview-refresh); } to { background-color: transparent; } }
 @media (prefers-reduced-motion: reduce) { .trigger-next-fire.refreshed { animation: none; } }
 .confirm-dialog { width: 440px; height: auto; }
+.log-json-col { width: 108px; }
+.run-log-dialog { width: 900px; height: min(760px, calc(100vh - 40px)); max-width: calc(100vw - 32px); }
+.run-log-dialog[open] { display: flex; flex-direction: column; }
+.run-log-json { flex: 1; min-height: 0; margin: 0; padding: 24px; overflow: auto; white-space: pre; font: 13px/1.7 Consolas, ui-monospace, monospace; }
+.run-log-dialog .editor-footer { justify-content: flex-end; }
 .confirm-body { padding: 0 30px 26px; overflow-wrap: anywhere; }
 .confirm-dialog .editor-footer { justify-content: flex-end; }
 .toast { display: none; }

@@ -9,7 +9,7 @@
 <body>
   <div class="app-container">
     <header class="app-header">
-      <div class="header-title"><h1>增强计划任务</h1><span class="plugin-version">v1.5.3</span></div>
+      <div class="header-title"><h1>增强计划任务</h1><span class="plugin-version">v1.6.0</span></div>
       <nav class="tab-nav" aria-label="插件页面">
         <button type="button" class="tab-btn active" data-tab="tasks" aria-current="page">计划任务</button>
         <button type="button" class="tab-btn" data-tab="logs">运行日志</button>
@@ -29,9 +29,9 @@
       <section id="view-logs" class="tab-view" aria-labelledby="logs-title">
         <div class="page-heading"><h2 id="logs-title">运行日志</h2><button class="btn btn-secondary" id="refresh-logs-btn" type="button">刷新</button></div>
         <div class="table-surface"><table class="data-table logs-table">
-          <colgroup><col class="log-time-col"><col class="log-task-col"><col class="log-trigger-col"><col class="log-action-col"><col></colgroup>
-          <thead><tr><th scope="col">精确时间</th><th scope="col">任务</th><th scope="col">触发情况</th><th scope="col">动作</th><th scope="col">详情</th></tr></thead>
-          <tbody id="logs-body"><tr><td colspan="5" class="table-empty">暂无运行日志。</td></tr></tbody>
+          <colgroup><col class="log-time-col"><col class="log-task-col"><col class="log-trigger-col"><col class="log-action-col"><col><col class="log-json-col"></colgroup>
+          <thead><tr><th scope="col">精确时间</th><th scope="col">任务</th><th scope="col">触发情况</th><th scope="col">动作</th><th scope="col">详情</th><th scope="col">原始信息</th></tr></thead>
+          <tbody id="logs-body"><tr><td colspan="6" class="table-empty">暂无运行日志。</td></tr></tbody>
         </table></div><div class="pager" id="logs-pager"></div>
       </section>
       <section id="view-llm" class="tab-view" aria-labelledby="llm-title">
@@ -63,6 +63,7 @@
         <section id="editor-basic" class="editor-panel" role="tabpanel" aria-labelledby="tab-basic">
           <div class="task-enabled-row"><label class="switch-toggle"><input id="task-enabled" type="checkbox" role="switch" checked><span class="slider"></span></label><label for="task-enabled">启用此任务</label></div>
           <div class="field"><label for="task-name">任务名称</label><input id="task-name" class="form-input" placeholder="例如：喝水提醒" autocomplete="off" required aria-describedby="task-name-count"><div class="name-hint field-hint"><span id="task-name-count"></span></div></div>
+          <div class="field"><label for="task-expires-at">有效期截止时间</label><input id="task-expires-at" class="form-input" type="datetime-local" step="1"><p class="field-hint">留空表示不限制，到期后自动停用。时间按当前浏览器时区显示。</p></div>
           <div class="field target-field"><label for="target-select">发送对象</label><div class="target-method"><label><input id="target-method-session" type="radio" name="target-method" checked>选择会话</label><label><input id="target-method-manual" type="radio" name="target-method">手动输入 UMO</label></div><select id="target-select" class="form-input"><option value="">不指定发送对象</option></select><input id="target-custom" class="form-input" placeholder="平台:消息类型:标识" aria-label="手动输入发送对象 UMO" hidden></div>
         </section>
         <section id="editor-rules" class="editor-panel" role="tabpanel" aria-labelledby="tab-rules" hidden>
@@ -77,12 +78,14 @@
           <div class="field"><label for="task-text" id="task-text-label">任务提示词</label><textarea id="task-text" class="form-input" rows="6"></textarea><div class="field-hint">留空表示空动作：照常执行与记日志，不发送消息。</div></div>
           <div class="setting-row compact"><div><label for="task-time-aware">时间感知</label><p>向 AI 提供触发时的日期与时间。</p></div><label class="switch-toggle"><input id="task-time-aware" type="checkbox" role="switch" checked><span class="slider"></span></label></div>
           <div class="setting-row compact"><div><label for="task-holiday-aware">节假日感知</label><p>附加工作日与节假日信息。</p></div><label class="switch-toggle"><input id="task-holiday-aware" type="checkbox" role="switch"><span class="slider"></span></label></div>
+          <div class="setting-row compact"><div><label for="task-record-history">将回复记入对话记录</label><p>发送成功后，将 bot 消息加入目标对话上下文。</p></div><label class="switch-toggle"><input id="task-record-history" type="checkbox" role="switch" checked><span class="slider"></span></label></div>
         </section>
       </div>
       <div class="editor-body" id="task-json-body" style="display:none"><section class="editor-panel"><div class="field"><label for="task-json">任务 JSON</label><span class="field-hint">一般不要修改，除非你知道你在做什么。</span><textarea class="json-editor" id="task-json" spellcheck="false"></textarea></div></section></div>
       <footer class="editor-footer"><span class="muted" id="next-fire-hint"></span><div class="button-group"><button class="btn btn-secondary" type="button" id="modal-cancel-btn">取消</button><button class="btn btn-primary" type="submit" id="modal-submit-btn">保存任务</button></div></footer>
     </form>
   </dialog>
+  <dialog id="run-log-modal" class="run-log-dialog" aria-labelledby="run-log-title"><header class="editor-header"><h2 id="run-log-title">运行日志 JSON</h2></header><pre id="run-log-json" class="run-log-json" tabindex="0"></pre><footer class="editor-footer"><button type="button" class="btn btn-secondary" id="run-log-close">关闭</button></footer></dialog>
   <dialog id="confirm-modal-overlay" class="confirm-dialog" aria-labelledby="confirm-title"><header class="editor-header"><h2 id="confirm-title">确认操作</h2></header><div class="confirm-body"><p id="confirm-modal-text">确定？</p></div><footer class="editor-footer"><button class="btn btn-secondary" type="button" id="confirm-modal-cancel-btn">取消</button><button class="btn btn-danger" type="button" id="confirm-modal-ok-btn">确定</button></footer></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <div class="b64-popover" id="b64-popover"></div>

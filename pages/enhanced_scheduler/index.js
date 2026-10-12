@@ -47,6 +47,11 @@ async function init() {
         const m = s.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})/);
         return m ? m[1] : s;
     }
+    function expiryInputValue(ts) {
+        if (!ts) return "";
+        const d = new Date(ts * 1000);
+        return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19);
+    }
 
     // ── Tab 切换 ──
     document.querySelectorAll(".tab-btn").forEach(btn => {
@@ -100,7 +105,7 @@ async function init() {
         body.innerHTML = keys.map(k => {
             const t = allTasks[k];
             const trgList = Array.isArray(t.triggers) ? t.triggers.filter(tr => tr && typeof tr === "object") : [];
-            const labels = {interval: "周期", cron: "cron", random: "随机", window: "区间", cooldown: "冷却"};
+            const labels = {interval: "周期", cron: "cron", random: "随机", window: "区间", cooldown: "冷却", contextual: "语境"};
             const trigSummary = [...new Set(trgList.map(tr => labels[tr.type] || tr.type))].map(escapeHtml).join("，");
             const ct = t.content || {};
             const mode = ct.mode;
@@ -113,9 +118,9 @@ async function init() {
             return `
                 <tr>
                     <td><button type="button" class="task-name edit-task-btn" data-id="${escapeHtml(k)}">${escapeHtml(t.name)}</button><div class="cell-secondary task-target" title="${escapeHtml(t.target || '')}">${escapeHtml(t.target || "未指定发送对象")}</div></td>
-                    <td class="cell-wrap"><span class="badge ${stateClass}">${escapeHtml(stateText)}</span>${runtime.error ? `<div class="form-hint row-error">${escapeHtml(runtime.error)}</div>` : ''}</td>
+                    <td class="cell-wrap"><span class="badge ${stateClass}">${escapeHtml(stateText)}</span>${runtime.error ? `<div class="form-hint row-error">${escapeHtml(runtime.error)}</div>` : ''}${runtime.reason ? `<div class="cell-secondary">${escapeHtml(runtime.reason)}</div>` : ''}${t.expires_at ? `<div class="cell-secondary">有效期至 ${fmtTs(t.expires_at)}</div>` : ''}</td>
                     <td class="cell-wrap">${trigSummary || '—'}</td>
-                    <td class="next-check">${nf ? `<time class="tabular">${fmtTs(nf)}</time><div class="cell-secondary">${probabilityText(t._execution_probability)}</div><div class="cell-secondary next-relative" data-next-fire="${Number(nf)}">${remainingTime(nf)}</div>` : (t.enabled && t._execution_probability === 0 ? '不会执行（概率 0%）' : '—')}</td>
+                    <td class="next-check">${nf ? `<time class="tabular">${fmtTs(nf)}</time><div class="cell-secondary">${probabilityText(t._execution_probability, trgList.some(tr => tr.type === "contextual"))}</div><div class="cell-secondary next-relative" data-next-fire="${Number(nf)}">${remainingTime(nf)}</div>` : (t.enabled && t._execution_probability === 0 ? '不会执行（概率 0%）' : '—')}</td>
                     <td>${hasText ? escapeHtml(modeCN) : '空动作'}</td>
                     <td><div class="actions-cell">
                         <button type="button" class="text-btn edit-task-btn" data-id="${escapeHtml(k)}">编辑</button>
@@ -131,8 +136,9 @@ async function init() {
         const d = Math.floor(total / 1440), h = Math.floor(total % 1440 / 60), m = total % 60;
         return `还剩 ${d ? d + "天" : ""}${h ? h + "时" : ""}${m}分`;
     }
-    function probabilityText(probability) {
+    function probabilityText(probability, hasContextual = false) {
         if (typeof probability !== "number" || !Number.isFinite(probability)) return "";
+        if (hasContextual && probability > 0) return probability === 1 ? "语境待判定" : `随机通过概率 ${Number((probability * 100).toPrecision(4))}%，语境待判定`;
         return `以${Number((probability * 100).toPrecision(4))}%概率执行`;
     }
     function triggerLabels(items) {
@@ -169,15 +175,15 @@ async function init() {
         if (logsPage > pages - 1) return loadRunLogs(pages - 1);
         const entries = res.entries || [];
         if (!entries.length) {
-            body.innerHTML = `<tr><td colspan="5" class="table-empty">暂无日志。任务触发后会在此显示最近记录。</td></tr>`;
+            body.innerHTML = `<tr><td colspan="6" class="table-empty">暂无日志。任务触发后会在此显示最近记录。</td></tr>`;
             $("logs-pager").innerHTML = "";
             return;
         }
-        body.innerHTML = entries.map(l => {
+        body.innerHTML = entries.map((l, index) => {
             const tofStr = formatTriggerResults(l);
             const triggerInfo = l.source === "manual" ? "手动触发，跳过触发器检查。" : `${tofStr ? tofStr + "；" : ""}${l.logic_result ? "条件全部通过。" : "条件未全部满足。"}`;
-            const actionCN = {send_llm:"AI 发送",send_fixed:"发送文本",noop:"空动作",partial:"部分失败",skipped:"跳过",failed:"失败"}[l.action] || l.action;
-            const actionBadge = ["skipped", "noop"].includes(l.action) ? "badge-skipped" : (l.action === "failed" || l.action === "partial" ? "badge-failed" : "badge-active");
+            const actionCN = {send_llm:"AI 发送",send_fixed:"发送文本",noop:"空动作",partial:"部分失败",skipped:"跳过",failed:"失败",expired:"到期停用"}[l.action] || l.action;
+            const actionBadge = ["skipped", "noop", "expired"].includes(l.action) ? "badge-skipped" : (l.action === "failed" || l.action === "partial" ? "badge-failed" : "badge-active");
             const detail = l.detail || "";
             const results = l.target_result ? [l.target_result] : [];
             const targetInfo = results.map(tr => `发送对象：${tr.umo || "—"}，${tr.ok ? '成功' : '失败' + (tr.error ? '：' + tr.error : '')}。`).join(" ");
@@ -187,10 +193,20 @@ async function init() {
                 <td class="cell-wrap">${escapeHtml(triggerInfo)}</td>
                 <td><span class="badge ${actionBadge}">${escapeHtml(actionCN)}</span></td>
                 <td class="log-detail">${escapeHtml(detail)} ${escapeHtml(targetInfo)}</td>
+                <td><button type="button" class="text-btn log-json-btn" data-log-index="${index}">查看 JSON</button></td>
             </tr>`;
         }).join("");
+        body.querySelectorAll(".log-json-btn").forEach(button => button.addEventListener("click", () => openRunLogJson(entries[Number(button.dataset.logIndex)])));
         renderLogsPager(pages, total);
     }
+
+    function openRunLogJson(log) {
+        // Keep the fetched event snapshot intact even when tasks/log pages refresh.
+        $("run-log-json").textContent = JSON.stringify(log, null, 2);
+        $("run-log-json").scrollTop = 0;
+        if (!$("run-log-modal").open) $("run-log-modal").showModal();
+    }
+    $("run-log-close").addEventListener("click", () => $("run-log-modal").close());
 
     function renderLogsPager(pages, total) {
         const pager = $("logs-pager");
@@ -312,7 +328,7 @@ async function init() {
     function renderLlmPlaceholders(entries) {
         const list = $("llm-log-list");
         list.innerHTML = entries.map(m => {
-            const modeCN = m.mode === "conversation" ? "对话AI" : "独立AI";
+            const modeCN = {conversation: "对话AI", standalone: "独立AI", contextual: "语境判定"}[m.mode] || m.mode;
             const imgInfo = (m.images && m.images.length) ? ` / ${m.images.length}图 ${fmtSize(m.image_bytes)}` : "";
             return `
                 <details class="llm-log-card">
@@ -579,13 +595,14 @@ async function init() {
     // ── 任务编辑弹窗 ──
     const modal = $("task-modal");
     const ACTIVE_TYPES = ["interval", "cron"];
-    const PASSIVE_TYPES = ["window", "random", "cooldown"];
+    const PASSIVE_TYPES = ["window", "cooldown", "random", "contextual"];
     const TYPE_INFO = {
         interval: { kind: "active", label: "周期触发", desc: "从基准时间起，按固定间隔检查任务。" },
         cron: { kind: "active", label: "cron 触发", desc: "按日历时间检查任务。" },
         window: { kind: "passive", label: "时间区间", desc: "仅在所选星期与时间区间内通过检查。" },
         random: { kind: "passive", label: "随机条件", desc: "主动触发后，按设置的概率判断是否通过。" },
         cooldown: { kind: "passive", label: "冷却条件", desc: "距本任务上次成功达到指定时长后，条件通过。" },
+        contextual: { kind: "passive", label: "语境条件", desc: "独立调用 AI，判断最近的消息是否符合语境要求。" },
     };
     const WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 
@@ -659,6 +676,8 @@ async function init() {
         $("trigger-panel").innerHTML = "";
         lastValidate = { triggers: [], has_active: false, next_fire: null };
         lastSuccessTime = task ? Number(task.last_success_time || 0) : 0;
+        $("task-expires-at").value = expiryInputValue(task && task.expires_at);
+        $("task-record-history").checked = !task || (task.content || {}).record_history !== false;
 
         if (task) {
             $("modal-title-text").textContent = "编辑任务";
@@ -714,6 +733,7 @@ async function init() {
         if (type === "cron") return { expr: "" };
         if (type === "window") return { start: "08:00", end: "20:00", weekdays: [0, 1, 2, 3, 4, 5, 6] };
         if (type === "random") return { threshold: 0.5 };
+        if (type === "contextual") return {requirement: "", history_count: 20, provider_id: "", model: "", time_aware: true, holiday_aware: false};
         return { hours: 4, minutes: 0 };
     }
     function normalizeDurationConfig(type, cfg) {
@@ -768,6 +788,7 @@ async function init() {
             el.addEventListener("change", update);
             if (el.type === "number") el.addEventListener("wheel", e => e.preventDefault(), {passive: false});
         });
+        if (t.type === "contextual") loadContextModels(t);
         panel.querySelectorAll(".weekday-chip input").forEach(cb => cb.addEventListener("change", () => syncPanelToTrigger(t)));
         updatePanelNextFire();
     }
@@ -789,7 +810,32 @@ async function init() {
             return `<div class="trigger-config-fields"><div class="field"><label for="trigger-start">开始时间</label><input id="trigger-start" type="time" data-field="start" value="${escapeHtml(c.start || '08:00')}"></div><div class="field"><label for="trigger-end">结束时间</label><input id="trigger-end" type="time" data-field="end" value="${escapeHtml(c.end || '20:00')}"></div><div class="field full-row"><span class="field-label">星期</span><div class="weekdays-group">${WEEKDAY_CN.map((day, i) => `<label class="weekday-chip"><input type="checkbox" data-weekday="${i}" ${wd.includes(i) ? 'checked' : ''}>${day}</label>`).join('')}</div><p class="field-hint">支持跨天区间，例如 22:00 至次日 06:00。</p></div></div>`;
         }
         if (t.type === "random") return `<div class="field narrow-field"><label for="trigger-probability">通过概率</label><input id="trigger-probability" type="number" data-field="threshold" min="0" max="1" step="0.01" value="${escapeHtml(c.threshold != null ? c.threshold : 0.5)}"><p class="field-hint">范围 0–1，0.15 表示 15%。</p></div>`;
+        if (t.type === "contextual") return `<div class="field"><label for="context-requirement">语境要求</label><textarea id="context-requirement" data-field="requirement" rows="5">${escapeHtml(c.requirement || '')}</textarea></div>
+            <div class="field"><label for="context-count">上下文条数</label><input id="context-count" type="number" data-field="history_count" min="1" max="200" step="1" value="${escapeHtml(c.history_count ?? 20)}"><p class="field-hint">优先读取已记录的平台消息，无记录时读取当前对话历史。</p></div>
+            <div class="field"><label for="context-provider">模型提供商</label><select id="context-provider" data-field="provider_id"><option value="">使用目标对话的 LLM</option>${c.provider_id ? `<option value="${escapeHtml(c.provider_id)}" selected>${escapeHtml(c.provider_id)}</option>` : ''}</select></div>
+            <div class="field"><label for="context-model">模型</label><input id="context-model" data-field="model" list="context-model-options" value="${escapeHtml(c.model || '')}" placeholder="使用提供商当前模型"><datalist id="context-model-options"></datalist><p class="field-hint" id="context-model-hint">可选择或输入模型名称，留空使用当前模型。</p></div>
+            <div class="setting-row compact"><label for="context-time">时间感知</label><label class="switch-toggle"><input id="context-time" type="checkbox" role="switch" data-field="time_aware" ${c.time_aware !== false ? 'checked' : ''}><span class="slider"></span></label></div>
+            <div class="setting-row compact"><label for="context-holiday">节假日感知</label><label class="switch-toggle"><input id="context-holiday" type="checkbox" role="switch" data-field="holiday_aware" ${c.holiday_aware ? 'checked' : ''}><span class="slider"></span></label></div>`;
         return `<div class="field"><span class="field-label">冷却时长</span><div class="duration-fields two">${number('hours', '小时')}${number('minutes', '分钟', 59)}</div></div>`;
+    }
+
+    async function loadContextModels(t) {
+        const providerId = t.config.provider_id || "";
+        const providerInput = $("context-provider"), modelOptions = $("context-model-options");
+        try {
+            const res = await bridge.apiGet("get_providers", {provider_id: providerId});
+            if (selectedTriggerId !== t.id || t.type !== "contextual" || (t.config.provider_id || "") !== providerId || $("context-provider") !== providerInput) return;
+            if (!res || res.status !== "success") throw new Error(res && res.message || "获取模型选项失败");
+            const providers = res.providers || [];
+            const ids = providers.map(p => p.id);
+            if (providerId && !ids.includes(providerId)) ids.push(providerId);
+            providerInput.innerHTML = '<option value="">使用目标对话的 LLM</option>' + ids.map(id => `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`).join('');
+            providerInput.value = providerId;
+            modelOptions.innerHTML = (res.models || []).map(model => `<option value="${escapeHtml(model)}"></option>`).join('');
+            $("context-model-hint").textContent = res.message || "可选择或输入模型名称，留空使用当前模型。";
+        } catch (e) {
+            if ($("context-provider") === providerInput) $("context-model-hint").textContent = e.message;
+        }
     }
 
     function syncPanelToTrigger(t) {
@@ -811,6 +857,14 @@ async function init() {
             t.config = { threshold: isNaN(v) ? 0 : v };
         } else if (t.type === "cooldown") {
             t.config = { hours: int("hours", 0), minutes: int("minutes", 0) };
+        } else if (t.type === "contextual") {
+            const providerId = get("provider_id");
+            const changedProvider = providerId !== (t.config.provider_id || "");
+            t.config = {requirement: get("requirement"), history_count: int("history_count", 20),
+                provider_id: providerId, model: changedProvider ? "" : get("model").trim(),
+                time_aware: panel.querySelector('[data-field="time_aware"]').checked,
+                holiday_aware: panel.querySelector('[data-field="holiday_aware"]').checked};
+            if (changedProvider) { $("context-model").value = ""; loadContextModels(t); }
         }
         renderTriggerCanvas();
         updateValidateHints();
@@ -896,6 +950,7 @@ async function init() {
         el.closest(".switch-toggle").classList.toggle("disabled", disabled);
     }
     $("task-mode").addEventListener("change", updateContentMode);
+    $("task-expires-at").addEventListener("change", scheduleValidate);
 
     // ── 触发器实时校验 + 下次任务时间 ──
     function scheduleValidate() {
@@ -911,7 +966,7 @@ async function init() {
             return;
         }
         if (lastValidate.next_fire) {
-            el.textContent = "下次任务时间：" + fmtTs(lastValidate.next_fire) + " " + probabilityText(lastValidate.execution_probability);
+            el.textContent = "下次任务时间：" + fmtTs(lastValidate.next_fire) + " " + probabilityText(lastValidate.execution_probability, lastValidate.has_contextual);
         } else if (lastValidate.execution_probability === 0) {
             el.textContent = "下次任务时间：不会执行（概率 0%）";
         } else if ((lastValidate.triggers || []).some(t => !t.ok)) {
@@ -933,7 +988,7 @@ async function init() {
             return;
         }
         // 区间型/随机型没有可展示的时间信息，整行隐藏
-        if (t.type === "window" || t.type === "random") {
+        if (t.type === "window" || t.type === "random" || t.type === "contextual") {
             el.style.display = "none";
             return;
         }
@@ -962,10 +1017,11 @@ async function init() {
         const revision = validateRevision;
         const payload = triggers.map(t => ({ id: t.id, type: t.type, config: t.config }));
         try {
-            const res = await bridge.apiPost("validate", { triggers: payload, task_id: $("task-id").value || undefined });
+            const res = await bridge.apiPost("validate", { triggers: payload, task_id: $("task-id").value || undefined, expires_at: $("task-expires-at").value ? new Date($("task-expires-at").value).getTime() / 1000 : null });
             if (revision !== validateRevision || !modal.open) return;
             if (!res || res.status !== "success") return;
             lastValidate = res.results || { triggers: [], next_fire: null };
+            lastValidate.has_contextual = triggers.some(t => t.type === "contextual");
             if (Number.isFinite(lastValidate.last_success_time)) lastSuccessTime = lastValidate.last_success_time;
             updateValidateHints();
             updatePanelNextFire(true);
@@ -979,6 +1035,7 @@ async function init() {
             id: $("task-id").value || undefined,
             name: $("task-name").value.trim(),
             enabled: $("task-enabled").checked,
+            expires_at: $("task-expires-at").value ? new Date($("task-expires-at").value).getTime() / 1000 : null,
             triggers: triggers.map(t => ({ id: t.id, type: t.type, config: t.config })),
             content: {
                 text: $("task-text").value,
@@ -986,6 +1043,7 @@ async function init() {
                 system_prompt: $("task-system-prompt").value,
                 time_aware: $("task-time-aware").checked,
                 holiday_aware: $("task-holiday-aware").checked,
+                record_history: $("task-record-history").checked,
             },
             target: $("target-custom").value.trim(),
         };
@@ -996,6 +1054,8 @@ async function init() {
         const c = obj.content || {};
         $("task-name").value = obj.name || "";
         $("task-enabled").checked = obj.enabled !== false;
+        $("task-expires-at").value = expiryInputValue(obj.expires_at);
+        $("task-record-history").checked = c.record_history !== false;
         $("task-mode").value = c.mode || "fixed";
         $("task-text").value = c.text || "";
         $("task-system-prompt").value = c.system_prompt || "";
@@ -1053,6 +1113,8 @@ async function init() {
             return;
         }
         if (String(obj.name || "").trim().length > taskNameMaxLength) { showToast(`任务名称不能超过 ${taskNameMaxLength} 个字符`, true); return; }
+        if (obj.expires_at != null && (typeof obj.expires_at !== "number" || !Number.isFinite(obj.expires_at) || obj.expires_at <= 0 || !Number.isFinite(new Date(obj.expires_at * 1000).getTime()))) { showToast("有效期必须是正数 Unix 时间戳或 null", true); return; }
+        if (obj.content && obj.content.record_history !== undefined && typeof obj.content.record_history !== "boolean") { showToast("将回复记入对话记录必须是布尔值", true); return; }
         applyTaskPayload(obj);
         setJsonMode(false);
     });
@@ -1062,7 +1124,8 @@ async function init() {
         if ($("task-name").value.trim().length > taskNameMaxLength) { showToast(`任务名称不能超过 ${taskNameMaxLength} 个字符`, true); chooseEditorTab("basic"); return false; }
         if (!triggers.length) { showToast("至少需要一个触发器", true); return false; }
         if (!activeTriggers().length) { showToast("至少需要一个主动型触发器（周期型或 cron 型）", true); return false; }
-        if (!$("target-custom").value.trim() && $("task-text").value.trim()) { showToast("请选择一个发送目标对话", true); return false; }
+        if (!$("target-custom").value.trim() && ($("task-text").value.trim() || triggers.some(t => t.type === "contextual"))) { showToast("请选择一个发送目标对话", true); return false; }
+        if ($("task-expires-at").value && !Number.isFinite(new Date($("task-expires-at").value).getTime())) { showToast("有效期时间格式错误", true); return false; }
         return true;
     }
 

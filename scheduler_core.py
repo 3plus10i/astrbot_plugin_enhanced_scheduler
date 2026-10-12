@@ -16,6 +16,7 @@ scheduler_core.py — 增强计划任务插件的核心调度逻辑
   window    被动-区间型：每天 start~end 且当天星期几在 weekdays 中时为真
   random    被动-随机型：每次求值时采样 U(0,1) < threshold 为真
   cooldown  被动-冷却型：now - task_last_success >= 冷却时长 为真
+  contextual 被动-语境型：由执行器独立调用 AI 判定消息上下文
 """
 
 from __future__ import annotations
@@ -43,9 +44,10 @@ T_CRON = "cron"
 T_WINDOW = "window"
 T_RANDOM = "random"
 T_COOLDOWN = "cooldown"
+T_CONTEXTUAL = "contextual"
 
 ACTIVE_TYPES = (T_INTERVAL, T_CRON)      # 主动型：自己到点触发（多个之间取"或"）
-PASSIVE_TYPES = (T_WINDOW, T_RANDOM, T_COOLDOWN)  # 被动型：被主动型唤起后求值（多个之间取"且"）
+PASSIVE_TYPES = (T_WINDOW, T_COOLDOWN, T_RANDOM, T_CONTEXTUAL)
 ALL_TYPES = ACTIVE_TYPES + PASSIVE_TYPES
 MAX_TRIGGER_ID = (1 << 53) - 1  # 前端 Number 可精确表示的整数上限。
 
@@ -192,7 +194,48 @@ def validate_trigger(trigger: Dict[str, Any]) -> Tuple[bool, str]:
         if hours == 0 and minutes == 0:
             return False, "冷却时长必须大于 0"
 
+    elif ttype == T_CONTEXTUAL:
+        if not isinstance(cfg.get("requirement"), str) or not cfg["requirement"].strip():
+            return False, "语境要求不能为空"
+        count = cfg.get("history_count", 20)
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 200:
+            return False, "上下文条数必须是 1-200 的整数"
+        for key in ("provider_id", "model"):
+            if not isinstance(cfg.get(key, ""), str):
+                return False, f"{key} 必须是字符串"
+        for key in ("time_aware", "holiday_aware"):
+            if key in cfg and not isinstance(cfg[key], bool):
+                return False, f"{key} 必须是布尔值"
+
     return True, ""
+
+
+def validate_task_options(task: dict) -> Tuple[bool, str]:
+    content = task.get("content", {})
+    if not isinstance(content, dict):
+        return False, "任务内容格式错误"
+    expiry = task.get("expires_at")
+    if expiry is not None and (isinstance(expiry, bool) or not isinstance(expiry, (int, float))
+                               or not math.isfinite(expiry) or expiry <= 0):
+        return False, "有效期必须是正数 Unix 时间戳或 null"
+    if expiry is not None:
+        try:
+            datetime.fromtimestamp(expiry)
+        except (ValueError, OverflowError, OSError):
+            return False, "有效期超出可支持的日期范围"
+    if "record_history" in content and not isinstance(content["record_history"], bool):
+        return False, "将回复记入对话记录必须是布尔值"
+    return True, ""
+
+
+def task_expired(task: dict, now: float) -> bool:
+    expiry = task.get("expires_at")
+    return expiry is not None and now >= expiry
+
+
+def ordered_passives(triggers):
+    return sorted((tg for tg in triggers if tg.get("type") in PASSIVE_TYPES),
+                  key=lambda tg: (PASSIVE_TYPES.index(tg["type"]), tg["id"]))
 
 
 def _is_valid_hhmm(s: Any) -> bool:
@@ -307,9 +350,9 @@ def next_trigger_preview(triggers: List[Dict[str, Any]],
     """
     计算触发器组的下一次真正触发时刻（严格晚于 now_ts）。
 
-    五类触发器里只有随机型不可预测；interval / cron / window / cooldown 均可稳定
+    随机型与语境型不可预测；interval / cron / window / cooldown 均可稳定
     推算未来时刻，因此这里把非随机被动约束一并纳入：返回「任一主动触发器到点」
-    且「所有区间已开启、所有冷却已到期」的最早时刻。随机型不参与计算。
+    且「所有区间已开启、所有冷却已到期」的最早时刻。随机型与语境型不参与时间计算。
     无主动触发器、或约束无解（如多个区间交集为空）返回 None。
     """
     actives = [tg for tg in triggers if tg.get("type") in ACTIVE_TYPES]
@@ -477,6 +520,7 @@ def evaluate_task(triggers: List[Dict[str, Any]],
         "should_run": False,
         "has_active_fire": False,
         "trigger_tof": {},
+        "trigger_details": {},
     }
 
     # 先校验触发器；非法则直接返回（不触发）
@@ -500,17 +544,39 @@ def evaluate_task(triggers: List[Dict[str, Any]],
 
     result["has_active_fire"] = True
 
-    # 构造 tof_map：主动型按本轮 deadline 是否属于该触发器，被动型实时求值
+    # 纯逻辑条件短路；语境条件由 runtime 异步判定，不在这里调用 AI。
     tof_map: Dict[int, bool] = {}
-    passives_ok = True
+    details = result["trigger_details"]
     for tg in triggers:
+        if tg["type"] in ACTIVE_TYPES:
+            fired = tg["id"] in fired_ids
+            tof_map[tg["id"]] = fired
+            details[tg["id"]] = {"type": tg["type"], "status": "passed" if fired else "not_fired",
+                                  "result": fired, "fire_at": active_fire_at if fired else None}
+    passives_ok = True
+    for tg in ordered_passives(triggers):
         tid = tg["id"]
-        if tg.get("type") in ACTIVE_TYPES:
-            tof_map[tid] = tid in fired_ids
+        cfg = tg["config"]
+        if not passives_ok or tg["type"] == T_CONTEXTUAL:
+            details[tid] = {"type": tg["type"], "status": "not_checked", "result": None}
+            continue
+        evidence = {}
+        if tg["type"] == T_RANDOM:
+            sample = _random.random()
+            threshold = float(cfg["threshold"])
+            tof = sample < threshold
+            evidence = {"sample": sample, "threshold": threshold}
         else:
             tof = passive_tof(tg, now_ts, task_last_success)
-            tof_map[tid] = tof
-            passives_ok = passives_ok and tof
+            if tg["type"] == T_COOLDOWN:
+                evidence = {"elapsed_seconds": max(0, now_ts - task_last_success),
+                            "required_seconds": int(cfg.get("hours", 0)) * 3600 + int(cfg.get("minutes", 0)) * 60,
+                            "last_success_time": task_last_success}
+            elif tg["type"] == T_WINDOW:
+                evidence = {"checked_at": now_ts, "config": dict(cfg)}
+        tof_map[tid] = tof
+        details[tid] = {"type": tg["type"], "status": "passed" if tof else "rejected", "result": tof, **evidence}
+        passives_ok = tof
 
     result["trigger_tof"] = tof_map
     result["should_run"] = passives_ok

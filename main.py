@@ -1,5 +1,6 @@
 """AstrBot lifecycle and Web API for the enhanced scheduler."""
 import copy
+import asyncio
 import importlib.util
 import math
 import os
@@ -48,7 +49,7 @@ def _copy_task_name(source_name: str, existing_names: set[str]) -> str:
         number += 1
 
 
-@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，主动取或、被动取且的多触发器组合。", "1.5.3")
+@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，支持复杂的多触发条件组合。", "1.6.0")
 class EnhancedSchedulerPlugin(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):
         super().__init__(context)
@@ -60,7 +61,7 @@ class EnhancedSchedulerPlugin(Star):
 
     async def initialize(self):
         await self.runtime.start()
-        logger.info("[EnhancedScheduler] 已启动（每任务独立等待下一个未来触发点，不补发历史触发点）")
+        logger.info("[EnhancedScheduler] 已启动")
 
     async def terminate(self):
         await self.runtime.close()
@@ -76,6 +77,7 @@ class EnhancedSchedulerPlugin(Star):
         self.context.register_web_api(f"{prefix}/get_data", self._api_get_data, ["GET"], "获取任务与配置")
         self.context.register_web_api(f"{prefix}/save_config", self._api_save_config, ["POST"], "保存插件配置")
         self.context.register_web_api(f"{prefix}/get_sessions", self._api_get_sessions, ["GET"], "获取活跃会话列表")
+        self.context.register_web_api(f"{prefix}/get_providers", self._api_get_providers, ["GET"], "获取语境判定模型选项")
         self.context.register_web_api(f"{prefix}/upsert_task", self._api_upsert_task, ["POST"], "新增/更新任务")
         self.context.register_web_api(f"{prefix}/delete_task", self._api_delete_task, ["POST"], "删除任务")
         self.context.register_web_api(f"{prefix}/copy_task", self._api_copy_task, ["POST"], "复制任务")
@@ -101,6 +103,8 @@ class EnhancedSchedulerPlugin(Star):
             t_copy["_runtime"] = self.runtime.status(tid)
             try:
                 preview = core.next_task_preview(t.get("triggers", []), now, float(t.get("last_success_time", 0) or 0))
+                if t.get("expires_at") and preview["next_fire"] and preview["next_fire"] >= t["expires_at"]:
+                    preview["next_fire"] = None
                 t_copy["_next_fire"] = preview["next_fire"] if t_copy["_runtime"]["state"] in ("waiting", "running") else None
                 t_copy["_execution_probability"] = preview["execution_probability"]
             except Exception:
@@ -187,6 +191,30 @@ class EnhancedSchedulerPlugin(Star):
             return jsonify({"status": "error", "message": str(e)}), 500
 
 
+    async def _api_get_providers(self):
+        """Only expose chat provider IDs/models, never provider configuration or keys."""
+        from quart import request, jsonify
+        try:
+            selected = str(request.args.get("provider_id", "") or "").strip()
+            providers = []
+            for provider in self.context.get_all_providers():
+                meta = provider.meta()
+                providers.append({"id": meta.id, "model": provider.get_model()})
+            models, error = [], ""
+            if selected:
+                provider = next((p for p in self.context.get_all_providers() if p.meta().id == selected), None)
+                if provider is None:
+                    return jsonify({"status": "error", "message": "模型提供商不存在"}), 400
+                try:
+                    models = await asyncio.wait_for(provider.get_models(), timeout=10)
+                    models = [m for m in models if isinstance(m, str)]
+                except Exception as exc:
+                    error = f"模型列表获取失败，可手动输入模型名称: {exc}"
+            return jsonify({"status": "success", "providers": providers, "models": models, "message": error})
+        except Exception as exc:
+            return jsonify({"status": "error", "message": str(exc)}), 500
+
+
     def _upsert_task(self, req: dict) -> tuple:
         """新增或更新任务。req 含 id 时为更新，否则为新增。返回 (ok, msg, task_id)。"""
         tasks = self.store.data.setdefault("tasks", {})
@@ -255,6 +283,11 @@ class EnhancedSchedulerPlugin(Star):
         system_prompt = str(content.get("system_prompt", "") or "")
         time_aware = bool(content.get("time_aware", True))
         holiday_aware = bool(content.get("holiday_aware", False))
+        ok, msg = core.validate_task_options(req)
+        if not ok:
+            return False, msg, ""
+        record_history = content.get("record_history", True)
+        expires_at = req.get("expires_at")
 
         if "targets" in req:
             return False, "不再支持 targets 数组，请使用单个 target 对话字符串", ""
@@ -262,10 +295,13 @@ class EnhancedSchedulerPlugin(Star):
         if not isinstance(target, str):
             return False, "target 必须是单个对话字符串", ""
         target = target.strip()
-        if text.strip() and not target:
+        if (text.strip() or any(t["type"] == core.T_CONTEXTUAL for t in norm_triggers)) and not target:
             return False, "请选择一个发送目标对话（空动作可留空）", ""
 
         enabled = bool(req.get("enabled", True))
+        expired = expires_at is not None and now >= expires_at
+        if expired:
+            enabled = False
 
         if task_id and task_id in tasks:
             task = tasks[task_id]
@@ -277,6 +313,10 @@ class EnhancedSchedulerPlugin(Star):
                 task["last_success_time"] = 0.0
             task["name"] = name
             task["enabled"] = enabled
+            task["expires_at"] = expires_at
+            task.pop("disabled_reason", None)
+            if expired:
+                task["disabled_reason"] = "有效期已结束"
             task["triggers"] = norm_triggers
             task["content"] = {
                 "text": text,
@@ -284,6 +324,7 @@ class EnhancedSchedulerPlugin(Star):
                 "system_prompt": system_prompt,
                 "time_aware": time_aware,
                 "holiday_aware": holiday_aware,
+                "record_history": record_history,
             }
             task["target"] = target
             task["updated_at"] = now
@@ -294,6 +335,7 @@ class EnhancedSchedulerPlugin(Star):
                 "id": new_id,
                 "name": name,
                 "enabled": enabled,
+                "expires_at": expires_at,
                 "triggers": norm_triggers,
                 "content": {
                     "text": text,
@@ -301,11 +343,13 @@ class EnhancedSchedulerPlugin(Star):
                     "system_prompt": system_prompt,
                     "time_aware": time_aware,
                     "holiday_aware": holiday_aware,
+                    "record_history": record_history,
                 },
                 "target": target,
                 "last_success_time": 0.0,
                 "created_at": now,
                 "updated_at": now,
+                **({"disabled_reason": "有效期已结束"} if expired else {}),
             }
             return True, "", new_id
 
@@ -389,6 +433,12 @@ class EnhancedSchedulerPlugin(Star):
             task = self.store.tasks.get(str(req.get("task_id", "")), {})
             results["last_success_time"] = float(task.get("last_success_time", 0) or 0)
             results.update(core.next_task_preview(triggers, now, results["last_success_time"]))
+            expiry = req.get("expires_at", task.get("expires_at"))
+            ok, message = core.validate_task_options({"expires_at": expiry})
+            if not ok:
+                return jsonify({"status": "error", "message": message}), 400
+            if expiry and results["next_fire"] and results["next_fire"] >= expiry:
+                results["next_fire"] = None
             results["now"] = now
             return jsonify({"status": "success", "results": results})
         except Exception as e:
@@ -406,6 +456,12 @@ class EnhancedSchedulerPlugin(Star):
             now = time.time()
             task = self.store.tasks.get(str(req.get("task_id", "")), {})
             preview = core.next_task_preview(triggers, now, float(task.get("last_success_time", 0) or 0))
+            expiry = req.get("expires_at", task.get("expires_at"))
+            ok, message = core.validate_task_options({"expires_at": expiry})
+            if not ok:
+                return jsonify({"status": "error", "message": message}), 400
+            if expiry and preview["next_fire"] and preview["next_fire"] >= expiry:
+                preview["next_fire"] = None
             return jsonify({"status": "success", **preview, "now": now})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500

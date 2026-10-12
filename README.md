@@ -1,22 +1,22 @@
 # 增强计划任务 · Enhanced Scheduler
 
-<img src="logo.png" alt="增强计划任务 Logo" width="128" height="128">
+<img src="https://raw.githubusercontent.com/3plus10i/astrbot_plugin_enhanced_scheduler/refs/heads/main/logo.png" alt="增强计划任务 Logo" width="128" height="128">
 
 **让 AstrBot 按时提醒，也能偶尔主动找你聊聊。**
 
-从每天一句早安，到只在白天出现的随机问候：把时间、概率和冷却条件组合起来，发送固定文本，或让 AI 带着会话人格主动发言。独立调度，无需开启 AstrBot 原生「主动能力」。
+从每天一句早安，到只在白天出现的随机问候：把确定时间和概率条件组合起来，发送固定文本，或让 AI 带着会话人格主动发言。独立调度，无需开启 AstrBot 原生「主动能力」。
 
 **界面预览**
 <div align="center">
   <table>
     <tr>
       <td align="center">
-        <img src="screenshot-page-1.5.2.png" width="500" alt="截图1"/>
+        <img src="https://raw.githubusercontent.com/3plus10i/astrbot_plugin_enhanced_scheduler/refs/heads/main/screenshot-page-1.5.2.png" width="500" alt="截图1"/>
         <br/>
         <sub>图 1：任务列表截图</sub>
       </td>
       <td align="center">
-        <img src="screenshot-task-1.5.2.png" width="500" alt="截图2"/>
+        <img src="https://raw.githubusercontent.com/3plus10i/astrbot_plugin_enhanced_scheduler/refs/heads/main/screenshot-task-1.5.2.png" width="500" alt="截图2"/>
         <br/>
         <sub>图 2：任务触发器配置截图</sub>
       </td>
@@ -37,10 +37,10 @@
 
 ## 为什么用它？
 
-- **触发条件可组合**：周期、cron、时间区间、随机、冷却五种规则，兼顾准时提醒与随机互动。
+- **触发条件可组合**：周期、cron、时间区间、随机、冷却与 AI 语境判定，兼顾准时提醒与自然互动。
 - **消息内容可选择**：直接发送文本、使用独立 AI 提示词，或沿用目标会话的人格和上下文。
 - **全程页面配置**：在 WebUI 新建、编辑、复制任务，查看下次任务时间与执行概率。
-- **执行过程可查看**：支持手动触发，提供运行日志与 AI 请求、回复记录，方便检查配置效果。
+- **执行过程可查看**：支持手动触发，运行日志可通过“查看 JSON”检查原始判断依据；另外提供 AI 请求与回复记录。
 
 ## 快速开始
 
@@ -57,7 +57,7 @@
 
 **什么时候发？** 周期或 cron 提供触发机会，时间区间、随机和冷却进一步筛选。多个主动触发器满足任意一个即可，被动条件则须全部满足。
 
-![触发器组合逻辑：任一主动触发且全部被动条件满足时执行任务](触发器组合逻辑示意图.png)
+![触发器组合逻辑：任一主动触发且全部被动条件满足时执行任务](https://raw.githubusercontent.com/3plus10i/astrbot_plugin_enhanced_scheduler/refs/heads/main/触发器组合逻辑示意图.png)
 > *触发器组合逻辑：任一主动触发且全部被动条件满足时执行任务*
 
 例如「随机问候」：每 2 小时检查一次，仅在 08:00–20:00 内，以 50% 概率执行；距离上次成功执行至少 4 小时。选择「对话 AI」，提示词填入「给用户发送一条简短的日常问候」，即可让 bot 用当前会话的人格生成消息。

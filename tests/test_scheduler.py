@@ -13,7 +13,7 @@ import types
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -690,7 +690,7 @@ class BoundaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sends[-1][0], definition["target"])
             self.assertEqual(calls[-1]["chat_provider_id"], "provider-for-" + definition["target"])
             self.assertEqual(logs[-1]["mode"], mode)
-        self.assertEqual(histories[0][0], task("conversation")["target"])
+        self.assertEqual([entry[0] for entry in histories], [task("standalone")["target"], task("conversation")["target"]])
 
 
 class ApiTests(unittest.IsolatedAsyncioTestCase):
@@ -908,6 +908,66 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             name = self.plugin.store.tasks[copied["id"]]["name"]
             self.assertEqual(len(name), 12)
             self.assertTrue(name.endswith(main_module.COPY_NAME_SUFFIX))
+
+    async def test_new_fields_round_trip_and_old_tasks_default_to_recording(self):
+        self.request.body = task()
+        await self.plugin._api_upsert_task()
+        saved = self.plugin.store.tasks["a"]
+        self.assertTrue(saved["content"]["record_history"])
+        self.assertIsNone(saved["expires_at"])
+        self.request.body = copy.deepcopy(saved)
+        self.request.body["expires_at"] = time.time() + 3600
+        self.request.body["content"]["record_history"] = False
+        self.request.body["triggers"].append({"id": 2, "type": "contextual", "config": {"requirement": "学习", "history_count": 5, "time_aware": False}})
+        await self.plugin._api_upsert_task()
+        saved = self.plugin.store.tasks["a"]
+        self.assertFalse(saved["content"]["record_history"])
+        self.assertFalse(saved["triggers"][1]["config"]["time_aware"])
+        self.request.body = {"id": "a"}
+        copied = await self.plugin._api_copy_task()
+        self.assertEqual(self.plugin.store.tasks[copied["id"]]["expires_at"], saved["expires_at"])
+
+    async def test_invalid_expiry_and_history_switch_cannot_be_saved(self):
+        for expiry in (True, "tomorrow", 0, -1, float("inf")):
+            self.request.body = dict(task(), expires_at=expiry)
+            self.assertEqual((await self.plugin._api_upsert_task())[1], 400)
+        self.request.body = task()
+        self.request.body["content"]["record_history"] = "false"
+        self.assertEqual((await self.plugin._api_upsert_task())[1], 400)
+        self.assertEqual(self.plugin.store.tasks, {})
+
+    async def test_past_expiry_is_disabled_and_edit_can_reenable(self):
+        self.request.body = dict(task(), expires_at=time.time() - 1)
+        await self.plugin._api_upsert_task()
+        self.assertFalse(self.plugin.store.tasks["a"]["enabled"])
+        self.assertEqual(self.plugin.runtime.status("a")["reason"], "有效期已结束")
+        self.request.body["expires_at"] = None
+        await self.plugin._api_upsert_task()
+        self.assertTrue(self.plugin.store.tasks["a"]["enabled"])
+        self.assertNotIn("disabled_reason", self.plugin.store.tasks["a"])
+
+    async def test_contextual_needs_target_even_for_noop_and_expiry_limits_preview(self):
+        self.request.body = dict(task(), target="")
+        self.request.body["content"]["text"] = ""
+        self.request.body["triggers"].append({"id": 2, "type": "contextual", "config": {"requirement": "学习"}})
+        self.assertEqual((await self.plugin._api_upsert_task())[1], 400)
+        self.request.body = {"triggers": task()["triggers"], "expires_at": time.time() - 1}
+        result = await self.plugin._api_validate()
+        self.assertIsNone(result["results"]["next_fire"])
+
+    async def test_provider_choices_exclude_keys_and_model_failure_allows_manual_entry(self):
+        provider = types.SimpleNamespace(meta=lambda: types.SimpleNamespace(id="judge"),
+            get_model=lambda: "current", get_models=AsyncMock(return_value=["small", "large"]),
+            provider_config={"key": "secret"})
+        self.plugin.context.get_all_providers = lambda: [provider]
+        self.request.args = {"provider_id": "judge"}
+        result = await self.plugin._api_get_providers()
+        self.assertEqual(result["models"], ["small", "large"])
+        self.assertNotIn("secret", json.dumps(result))
+        provider.get_models.side_effect = RuntimeError("offline")
+        result = await self.plugin._api_get_providers()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["models"], [])
 
 
 if __name__ == "__main__":
