@@ -49,7 +49,7 @@ def _copy_task_name(source_name: str, existing_names: set[str]) -> str:
         number += 1
 
 
-@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，支持复杂的多触发条件组合。", "1.6.0")
+@register(PLUGIN_NAME, "3plus10i", "未来任务调度器，支持复杂的多触发条件组合。", "1.6.1")
 class EnhancedSchedulerPlugin(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):
         super().__init__(context)

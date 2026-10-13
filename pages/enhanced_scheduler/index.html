@@ -9,7 +9,7 @@
 <body>
   <div class="app-container">
     <header class="app-header">
-      <div class="header-title"><h1>增强计划任务</h1><span class="plugin-version">v1.6.0</span></div>
+      <div class="header-title"><h1>增强计划任务</h1><span class="plugin-version">v1.6.1</span></div>
       <nav class="tab-nav" aria-label="插件页面">
         <button type="button" class="tab-btn active" data-tab="tasks" aria-current="page">计划任务</button>
         <button type="button" class="tab-btn" data-tab="logs">运行日志</button>
@@ -75,9 +75,9 @@
         <section id="editor-content" class="editor-panel" role="tabpanel" aria-labelledby="tab-content" hidden>
           <div class="field"><label for="task-mode">执行模式</label><select id="task-mode" class="form-input"><option value="fixed">固定文本</option><option value="standalone">独立 AI</option><option value="conversation">对话 AI</option></select><p id="content-mode-detail" class="field-hint"></p></div>
           <div class="field" id="system-prompt-group"><label for="task-system-prompt">独立 AI 系统提示</label><textarea id="task-system-prompt" class="form-input" rows="3"></textarea><div class="field-hint">仅用于本任务，不注入目标会话的人格与上下文，可留空。</div></div>
-          <div class="field"><label for="task-text" id="task-text-label">任务提示词</label><textarea id="task-text" class="form-input" rows="6"></textarea><div class="field-hint">留空表示空动作：照常执行与记日志，不发送消息。</div></div>
-          <div class="setting-row compact"><div><label for="task-time-aware">时间感知</label><p>向 AI 提供触发时的日期与时间。</p></div><label class="switch-toggle"><input id="task-time-aware" type="checkbox" role="switch" checked><span class="slider"></span></label></div>
-          <div class="setting-row compact"><div><label for="task-holiday-aware">节假日感知</label><p>附加工作日与节假日信息。</p></div><label class="switch-toggle"><input id="task-holiday-aware" type="checkbox" role="switch"><span class="slider"></span></label></div>
+          <div class="field"><label for="task-text" id="task-text-label">任务提示词</label><textarea id="task-text" class="form-input" rows="4"></textarea><div class="field-hint">留空表示空动作：照常执行与记日志，不发送消息。</div></div>
+          <div class="setting-row compact" id="time-aware-group"><div><label for="task-time-aware">时间感知</label><p>向 AI 提供触发时的日期与时间。</p></div><label class="switch-toggle"><input id="task-time-aware" type="checkbox" role="switch" checked><span class="slider"></span></label></div>
+          <div class="setting-row compact" id="holiday-aware-group"><div><label for="task-holiday-aware">节假日感知</label><p>附加工作日与节假日信息。</p></div><label class="switch-toggle"><input id="task-holiday-aware" type="checkbox" role="switch"><span class="slider"></span></label></div>
           <div class="setting-row compact"><div><label for="task-record-history">将回复记入对话记录</label><p>发送成功后，将 bot 消息加入目标对话上下文。</p></div><label class="switch-toggle"><input id="task-record-history" type="checkbox" role="switch" checked><span class="slider"></span></label></div>
         </section>
       </div>

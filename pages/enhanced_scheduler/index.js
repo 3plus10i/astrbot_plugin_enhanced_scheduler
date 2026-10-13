@@ -941,13 +941,8 @@ async function init() {
         // 独立 AI 系统提示仅 standalone 模式使用
         $("system-prompt-group").style.display = mode === "standalone" ? "" : "none";
         // 两个感知开关仅对两种 AI 模式生效
-        setSwitchDisabled("task-time-aware", mode === "fixed");
-        setSwitchDisabled("task-holiday-aware", mode === "fixed");
-    }
-    function setSwitchDisabled(id, disabled) {
-        const el = $(id);
-        el.disabled = disabled;
-        el.closest(".switch-toggle").classList.toggle("disabled", disabled);
+        $("time-aware-group").style.display = mode === "fixed" ? "none" : "";
+        $("holiday-aware-group").style.display = mode === "fixed" ? "none" : "";
     }
     $("task-mode").addEventListener("change", updateContentMode);
     $("task-expires-at").addEventListener("change", scheduleValidate);

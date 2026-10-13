@@ -179,7 +179,7 @@ input:not([type="checkbox"]):not([type="radio"]):focus, select:focus, textarea:f
 .b64-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
 
 /* PC 编辑器：头尾固定，中间内容滚动；不在本轮引入移动端布局。 */
-dialog { padding: 0; border: 1px solid var(--border-color); border-radius: 12px; background: var(--bg-card); color: var(--text-primary); box-shadow: 0 24px 72px var(--shadow-dialog); width: 1080px; max-width: calc(100vw - 80px); height: min(810px, calc(100vh - 64px)); max-height: none; overflow: hidden; }
+dialog { padding: 0; border: 1px solid var(--border-color); border-radius: 12px; background: var(--bg-card); color: var(--text-primary); box-shadow: 0 24px 72px var(--shadow-dialog); width: 800px; max-width: calc(100vw - 80px); height: min(810px, calc(100vh - 64px)); max-height: none; overflow: hidden; }
 dialog::backdrop { background: var(--backdrop-color); backdrop-filter: blur(3px); }
 .editor-form { height: 100%; display: flex; flex-direction: column; }
 .editor-header { display: flex; align-items: flex-start; justify-content: space-between; padding: 24px 30px 17px; gap: 24px; flex: 0 0 auto; }
@@ -199,7 +199,7 @@ dialog::backdrop { background: var(--backdrop-color); backdrop-filter: blur(3px)
 .field input:not([type="radio"]):not([type="checkbox"]), .field select, .field textarea { width: 100%; }
 .field-hint { font-size: 12px; line-height: 1.65; }
 textarea { resize: vertical; line-height: 1.65; }
-#task-text { min-height: 165px; }
+#task-text { min-height: 120px; }
 #task-system-prompt { min-height: 95px; }
 .setting-row.compact { padding: 17px 0; }
 .setting-row.compact:last-child { border-bottom: 0; }
@@ -218,7 +218,7 @@ textarea { resize: vertical; line-height: 1.65; }
 .target-method label, .weekdays label { display: flex; align-items: center; gap: 7px; font-size: 13px; white-space: nowrap; }
 input[type="checkbox"], input[type="radio"] { accent-color: var(--color-primary); }
 .inline-notice { padding: 11px 0 11px 13px; border-left: 2px solid var(--color-warning); color: var(--text-secondary); font-size: 12px; }
-.rule-layout { display: grid; grid-template-columns: 335px minmax(0, 1fr); gap: 0; }
+.rule-layout { display: grid; grid-template-columns: 16em minmax(0, 1fr); gap: 0; }
 .rule-list-pane { padding-right: 25px; border-right: 1px solid var(--border-color); }
 .rule-explanation { max-width: 300px; }
 .rule-group-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; font-size: 13px; }
@@ -296,7 +296,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--color-primary)
 .trigger-next-fire.refreshed { animation: next-fire-refresh 1s ease-out; }
 @keyframes next-fire-refresh { from { background-color: var(--bg-preview-refresh); } to { background-color: transparent; } }
 @media (prefers-reduced-motion: reduce) { .trigger-next-fire.refreshed { animation: none; } }
-.confirm-dialog { width: 440px; height: auto; }
+/* fit-content 收缩到内容高度，避免满屏 */
+.confirm-dialog { width: 440px; height: fit-content; }
 .log-json-col { width: 108px; }
 .run-log-dialog { width: 900px; height: min(760px, calc(100vh - 40px)); max-width: calc(100vw - 32px); }
 .run-log-dialog[open] { display: flex; flex-direction: column; }
