@@ -4,12 +4,13 @@ import copy
 import json
 import time
 import urllib.request
-from typing import Any, Dict, List, Optional
+from types import SimpleNamespace
+from typing import Any, Dict, Optional
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
 from astrbot.api.provider import ProviderRequest
-# AstrBot 内部管线工具（对话 AI 模式用于正确构建请求并广播 on_llm_request 钩子）
-# 这些是框架内部路径，跨版本可能变动；导入失败时降级为「不广播钩子」而非崩溃。
+# AstrBot 内部请求钩子接口；不可用时保留旧版手动广播兼容路径。
+# 工具装配接口在执行时导入，接口不兼容会明确报错，不降级成无工具生成。
 try:
     from astrbot.core.pipeline.context_utils import call_event_hook as _call_event_hook
     from astrbot.core.star.star_handler import EventType as _EventType
@@ -40,6 +41,7 @@ CONTEXT_PROMPT = ('<scheduled_task>这是由计划任务语境判定组件触发
 # 该接口对空 User-Agent 返回 403，必须带上浏览器风格 UA
 HOLIDAY_API_URL = "https://timor.tech/api/holiday/info/"
 HOLIDAY_API_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+NO_MESSAGE = "<scheduler_no_message/>"
 
 class TaskExecutor:
     def __init__(self, context, config, core, store):
@@ -232,6 +234,9 @@ class TaskExecutor:
             )
         else:
             message, error, cid = await self._llm_generate_for_target(umo, prompt, log_ctx)
+        if not error and mode != "fixed" and message == NO_MESSAGE:
+            progress.update(generation_status="succeeded", send_status="not_needed", history_status="not_written")
+            return "noop", {"umo": umo, "ok": True, **progress}, "任务已完成，本次无需通知", True
         if error or not message:
             detail = error or "AI 生成结果为空"
             return "failed", {"umo": umo, "ok": False, "error": detail, "generation_status": "failed",
@@ -270,14 +275,14 @@ class TaskExecutor:
         """
         以目标会话 umo 的当前配置调用 LLM 生成回复。
 
-        正确复制 AstrBot 主 agent 的请求构建流程（_decorate_llm_request 的关键部分）：
+        复用 AstrBot 主 agent 的人格、Skills 与工具装配流程：
           1. 取该 UMO 的 chat_provider_id
           2. 取会话当前 conversation（历史 contexts + 会话级 persona_id）
           3. 取该 UMO 的 provider_settings（prompt_prefix / 默认人格）
           4. 经 persona_manager 解析人格，注入 system_prompt 与 begin_dialogs
           5. 广播 on_llm_request 钩子，让记忆等其它插件注入
-          6. 调用 context.llm_generate
-        每次调用都会把「最终发送给 AI 的完整请求体」与「AI 回复」写为一条 LLM 调用记录。
+          6. 装配工具并运行 AstrBot Agent 工具循环
+        每次执行记录初始请求、可用工具、工具调用过程和最终回复。
 
         返回 (text, error, cid)：error 为空表示成功，非空表示失败；cid 为目标会话当前
         对话 ID（供调用方在发送成功后把 assistant 回复回写到会话历史）。
@@ -339,11 +344,13 @@ class TaskExecutor:
                 req.prompt = f"{prefix}{req.prompt}"
 
         # 5) 人格（persona system_prompt + begin_dialogs）
-        await self._apply_persona(req, cfg, umo, conversation)
-
-        # 6) 广播 on_llm_request 钩子（其它插件注入）
-        event = _MockEvent(umo)
-        await self._broadcast_on_llm_request(event, req)
+        try:
+            event = await self._prepare_agent(req, umo, conversation_mode=True)
+            await self._broadcast_on_llm_request(event, req)
+        except Exception as exc:
+            msg = f"准备工具执行环境失败: {exc}"
+            await self._log_llm_call(log_ctx, umo, "conversation", None, None, msg, t0)
+            return _fail(msg)
 
         # 最终请求体（广播后 system_prompt / contexts / model 可能已被插件注入）
         request_body = {
@@ -354,20 +361,9 @@ class TaskExecutor:
             "prompt": req.prompt or user_prompt,
         }
 
-        kwargs: Dict[str, Any] = {
-            "chat_provider_id": provider_id,
-            "prompt": req.prompt,
-            "system_prompt": req.system_prompt or "",
-        }
-        if req.contexts:
-            kwargs["contexts"] = req.contexts
-        model = getattr(req, "model", None)
-        if model:
-            kwargs["model"] = model
-
         try:
             resp = await asyncio.wait_for(
-                self.context.llm_generate(**kwargs),
+                self._run_agent(req, event, provider_id, request_body),
                 timeout=self._llm_timeout(),
             )
             if resp and getattr(resp, "completion_text", None):
@@ -417,39 +413,6 @@ class TaskExecutor:
                 result["history_error"] = str(e)
             logger.warning(f"[EnhancedScheduler] 写入会话历史失败: {e}")
             return False
-
-    async def _apply_persona(self, req: ProviderRequest, cfg: dict, umo: str, conversation) -> None:
-        """复制主 agent 的人格注入：把当前会话人格的 system prompt 与开场白写入请求。
-
-        逻辑对齐 astr_main_agent._ensure_persona_and_skills 的核心部分（不含 skills/tools）。
-        """
-        try:
-            persona_mgr = getattr(self.context, "persona_manager", None)
-            if persona_mgr is None or not hasattr(persona_mgr, "resolve_selected_persona"):
-                return
-            platform_name = _platform_name_from_umo(umo)
-            conv_persona_id = getattr(conversation, "persona_id", None) if conversation is not None else None
-            _, persona, _, _ = await persona_mgr.resolve_selected_persona(
-                umo=umo,
-                conversation_persona_id=conv_persona_id,
-                platform_name=platform_name,
-                provider_settings=cfg,
-            )
-            if not persona:
-                return
-            if req.system_prompt is None:
-                req.system_prompt = ""
-            prompt = persona.get("prompt") if isinstance(persona, dict) else getattr(persona, "prompt", None)
-            if prompt:
-                req.system_prompt += f"\n# Persona Instructions\n\n{prompt}\n"
-            begin_dialogs = persona.get("_begin_dialogs_processed") if isinstance(persona, dict) else getattr(persona, "_begin_dialogs_processed", None)
-            if begin_dialogs:
-                try:
-                    req.contexts = list(begin_dialogs) + list(req.contexts or [])
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning(f"[EnhancedScheduler] 注入人格失败: {e}")
 
     async def _broadcast_on_llm_request(self, event, req: ProviderRequest):
         """广播 on_llm_request 钩子给其它已加载插件（人格/记忆等注入）。
@@ -502,7 +465,7 @@ class TaskExecutor:
         不广播 on_llm_request，因此不注入对话人格、也不与其它插件互动。
         但 chat_provider_id 仍需从指定 UMO 的会话配置正确获取。
         返回 (text, error)：error 为空表示成功，非空表示失败。
-        每次调用都会把「最终发送给 AI 的完整请求体」与「AI 回复」写为一条 LLM 调用记录。
+        每次执行记录初始请求、可用工具、工具调用过程和最终回复。
         """
         t0 = time.time()
         # 必须正确获取聊天模型 provider id，llm_generate 强制要求
@@ -528,13 +491,19 @@ class TaskExecutor:
         }
 
         try:
+            if purpose == "standalone":
+                req = ProviderRequest(prompt=user_prompt, system_prompt=system_prompt, session_id=umo)
+                req.model = model or None
+                event = await self._prepare_agent(req, umo, conversation_mode=False)
+                generation = self._run_agent(req, event, provider_id, request_body)
+            else:
+                # Contextual decisions must remain isolated and free of tool side effects.
+                generation = self.context.llm_generate(
+                    chat_provider_id=provider_id, prompt=user_prompt,
+                    system_prompt=system_prompt, **({"model": model} if model else {}),
+                )
             resp = await asyncio.wait_for(
-                self.context.llm_generate(
-                    chat_provider_id=provider_id,
-                    prompt=user_prompt,
-                    system_prompt=system_prompt,
-                    **({"model": model} if model else {}),
-                ),
+                generation,
                 timeout=self._llm_timeout(),
             )
             if resp and getattr(resp, "completion_text", None):
@@ -560,6 +529,91 @@ class TaskExecutor:
             logger.error(f"[EnhancedScheduler] {msg}")
             await self._log_llm_call(log_ctx, umo, purpose, request_body, None, msg, t0)
             return "", msg
+
+    async def _prepare_agent(self, req, umo, conversation_mode):
+        """Use AstrBot's own tool selection and a real scheduled event (>=4.27)."""
+        from astrbot.core import astr_main_agent as agent
+        from astrbot.core.cron.events import CronMessageEvent
+        from astrbot.core.platform.message_session import MessageSession
+
+        session = MessageSession.from_str(umo)
+        event = CronMessageEvent(context=self.context, session=session, message=req.prompt,
+                                 message_type=session.message_type, sender_name="EnhancedScheduler")
+        root_cfg = self.context.get_config(umo=umo)
+        cfg = dict(root_cfg.get("provider_settings", {}) or {})
+        cfg["plugin_set"] = root_cfg.get("plugin_set", ["*"])
+        allowed = cfg["plugin_set"]
+        event.plugins_name = None if "*" in allowed else list(allowed)
+        # The synthetic cron platform otherwise hides the target adapter from personas/tools.
+        platform = self.context.get_platform_inst(session.platform_id)
+        event.platform_meta.name = platform.meta().name if platform else _platform_name_from_umo(umo)
+        if session.message_type.value == "GroupMessage":
+            event.message_obj.group_id = session.session_id
+        if not getattr(req, "conversation", None):
+            cm = self.context.conversation_manager
+            cid = await cm.get_curr_conversation_id(umo)
+            conv = await cm.get_conversation(umo, cid) if cid else None
+            req.conversation = conv or SimpleNamespace(persona_id=None)
+        original_system, original_contexts = req.system_prompt, copy.deepcopy(req.contexts)
+        await agent._ensure_persona_and_skills(req, cfg, self.context, event)
+        if not conversation_mode:
+            # Tool availability follows the target persona; its text/history does not leak.
+            req.system_prompt, req.contexts = original_system, original_contexts
+        await agent._apply_web_search_tools(event, req, self.context)
+        runtime = cfg.get("computer_use_runtime", "none")
+        if runtime == "local":
+            agent._apply_local_env_tools(req, self.context)
+        elif runtime == "sandbox":
+            build_cfg = agent.MainAgentBuildConfig(tool_call_timeout=self._llm_timeout(),
+                                                   sandbox_cfg=cfg.get("sandbox", {}))
+            agent._apply_sandbox_tools(build_cfg, req, umo)
+        return event
+
+    async def _run_agent(self, req, event, provider_id, request_body):
+        from astrbot.core.astr_main_agent import _plugin_tool_fix
+        from astrbot.core.agent.hooks import BaseAgentRunHooks
+
+        _plugin_tool_fix(event, req)
+        req.system_prompt = (req.system_prompt or "") + (
+            "\n[计划任务执行规则]\n需要实时资料时必须使用可用工具，不得假装已查询。"
+            "工具不可用或查询失败时请明确说明。最终回复由调度器发送，请勿另行发送同一条通知。"
+            f"若任务明确要求仅在条件满足时通知，且查询确认条件不满足，仅输出 {NO_MESSAGE}。"
+            "空回复不表示无需通知。\n"
+        )
+        calls = []
+
+        class AuditHooks(BaseAgentRunHooks):
+            async def on_tool_start(self, run_context, tool, tool_args):
+                calls.append({"name": tool.name, "arguments": _json_safe(tool_args), "status": "started"})
+
+            async def on_tool_end(self, run_context, tool, tool_args, tool_result):
+                for row in reversed(calls):
+                    if row["name"] == tool.name and row["status"] == "started":
+                        row.update(status="finished", result=_json_safe(
+                            tool_result.model_dump() if hasattr(tool_result, "model_dump") else tool_result))
+                        break
+
+        request_body.update(system_prompt=req.system_prompt, contexts=copy.deepcopy(req.contexts or []),
+                            tools=[tool.name for tool in (req.func_tool or [])], tool_calls=calls)
+        # Use the same runner as tool_loop_agent, retaining model and hook-injected fields.
+        from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
+        from astrbot.core.astr_agent_context import AstrAgentContext, AgentContextWrapper
+        from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
+        provider = self.context.get_provider_by_id(provider_id)
+        if provider is None:
+            raise ValueError(f"未找到聊天模型: {provider_id}")
+        runner = ToolLoopAgentRunner()
+        await runner.reset(provider=provider, request=req,
+                           run_context=AgentContextWrapper(
+                               context=AstrAgentContext(context=self.context, event=event),
+                               tool_call_timeout=self._llm_timeout()),
+                           tool_executor=FunctionToolExecutor(), agent_hooks=AuditHooks(), streaming=False)
+        async for _ in runner.step_until_done(30):
+            pass
+        response = runner.get_final_llm_resp()
+        if response is None:
+            raise ValueError("工具执行结束但没有最终回复")
+        return response
 
     def _serialize_llm_response(self, resp) -> Optional[Dict[str, Any]]:
         """把 LLMResponse 转成可 JSON 序列化的字典（不含原始 raw_completion）。"""
@@ -730,50 +784,6 @@ def _platform_name_from_umo(umo: str) -> str:
 
 # ─────────────────────────────────────────────────────────────────────
 # AstrBot 事件适配
-
-
-class _MockEvent:
-    """轻量事件对象，供 on_llm_request 钩子读取会话信息（定时触发无真实事件）。
-
-    尽量对齐 AstrMessageEvent 的常用接口，使 call_event_hook 与各钩子能正常读取：
-    unified_msg_origin / plugins_name / is_stopped() / get_platform_name() / get_platform_id()。
-    """
-
-    def __init__(self, umo: str):
-        self.unified_msg_origin = umo
-        self.session_id = umo.split(":")[-1] if ":" in umo else umo
-        self.message_str = ""
-        self.message_obj = None
-        self.plugins_name: Optional[List[str]] = None
-        self._extra: Dict[str, Any] = {}
-        self._stopped = False
-
-    def get_extra(self, key, default=None):
-        return self._extra.get(key, default)
-
-    def set_extra(self, key, value):
-        self._extra[key] = value
-
-    def get_sender_id(self):
-        return "scheduler"
-
-    def get_sender_name(self):
-        return "EnhancedScheduler"
-
-    def get_group_id(self):
-        return ""
-
-    def get_platform_name(self):
-        return _platform_name_from_umo(self.unified_msg_origin)
-
-    def get_platform_id(self):
-        return ""
-
-    def is_stopped(self):
-        return self._stopped
-
-    def stop_event(self):
-        self._stopped = True
 
 
 def _is_on_llm_request_hook(handler) -> bool:

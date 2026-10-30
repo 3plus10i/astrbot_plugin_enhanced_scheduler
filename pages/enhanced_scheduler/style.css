@@ -9,9 +9,9 @@
   --text-secondary: var(--color-neutral);
   --border-color: #dfe3e8;
   --color-primary: #0078d4;
-  --color-success: #168456;
-  --color-danger: #c53636;
-  --color-warning: #eaa300;
+  --color-success: #52c41a;
+  --color-danger: #f5222d;
+  --color-warning: #faad14;
 
   /* 交互层次与语义底色均由原始色板混色得到。 */
   --color-primary-hover: color-mix(in srgb, var(--color-primary) 87%, var(--color-black));

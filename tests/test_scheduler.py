@@ -682,6 +682,10 @@ class BoundaryTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         executor = executor_module.TaskExecutor(context, {}, core, types.SimpleNamespace(append_llm_log=record))
+        executor._prepare_agent = AsyncMock(return_value=Mock())
+        async def run_agent(req, event, provider_id, request_body):
+            return await generate(chat_provider_id=provider_id, prompt=req.prompt)
+        executor._run_agent = run_agent
         for mode in ("standalone", "conversation"):
             definition = task(mode)
             definition["content"]["mode"] = mode

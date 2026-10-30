@@ -95,6 +95,10 @@ class ContextExecutorTests(unittest.IsolatedAsyncioTestCase):
             send_message=AsyncMock(), get_config=lambda **kwargs: {},
         )
         self.executor = executor_module.TaskExecutor(self.context, {}, core, types.SimpleNamespace(append_llm_log=record))
+        self.executor._prepare_agent = AsyncMock(return_value=Mock())
+        async def run_agent(req, event, provider_id, request_body):
+            return await self.context.llm_generate(chat_provider_id=provider_id, prompt=req.prompt)
+        self.executor._run_agent = run_agent
 
     async def test_context_only_reads_history_and_overrides_model_per_request(self):
         result = await self.executor.check_context(task(), contextual(provider_id="judge", model="small"), time.time(), "run")

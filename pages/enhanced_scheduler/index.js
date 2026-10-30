@@ -925,11 +925,11 @@ async function init() {
             label: "发送内容",
         },
         standalone: {
-            detail: "使用本任务的系统提示调用 AI，不注入会话人格与上下文。",
+            detail: "使用本任务的系统提示与可用工具，不注入会话人格提示与历史。",
             label: "任务提示词",
         },
         conversation: {
-            detail: "使用目标会话的人格与上下文生成回复。",
+            detail: "使用目标会话的人格、上下文与可用工具生成回复。",
             label: "任务提示词",
         },
     };
